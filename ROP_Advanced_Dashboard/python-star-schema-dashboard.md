@@ -426,7 +426,21 @@ Fact tables hold keys, measures and degenerate attributes only (Status, VED, Sup
 | Tests | `python -m pytest tests -q` |
 | Run dashboard | `run_dashboard.bat` (`python -m bokeh serve --show app.py`) |
 
+## Repository
+- Git root is the parent folder `ROP_Advanced_Dashboard_Package (1)`.
+- `master`: baseline commit of the original package.
+- `star-schema-refactor`: the refactor described below.
+- `.gitignore` keeps these out of Git; they stay on disk only:
+  - business data: `data/`, `snapshots/`, `powerbi_data/`, `*.xlsb`, `*.xlsx`
+  - generated files: `*.duckdb`, dashboard previews, `QA_REPORT.txt`
+  - backups and `__pycache__/`
+- A fresh clone needs the source files plus `python warehouse.py build` before the app can run.
+
 ## Change log
+### 2026-09-18 — Repository set up
+- Added `.gitignore`. Committed the original package as a baseline on `master` and the refactor on `star-schema-refactor`.
+- Deleting `README_MN.md` and `powerbi/` (DAX, Power Query, layout docs) is still uncommitted, pending a decision. The Power BI docs describe the old wide CSVs and would need updating if kept.
+
 ### 2026-09-18 — Star-schema refactor
 - Added `warehouse.py`, `queries.py`, `metrics.py`, `tests/`; `app.py` is now UI only.
 - Moved storage from CSV.gz to Parquet + DuckDB (`fact_sku_status` 15.9 MB → 1.8 MB). Old files backed up in `_backup_before_star_schema/`.
