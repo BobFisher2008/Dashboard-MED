@@ -1,0 +1,57 @@
+{
+  "snapshot_date": "2026-08-13",
+  "source_files": {
+    "rop": "ROP тооцоолол.xlsb",
+    "master": "ROP_үлдэгдэл_автомат_дашбоард_v1.xlsx",
+    "inventory": "Үлд 20260813 агуулахгүй.xlsx"
+  },
+  "inventory_parser": {
+    "source_file": "Үлд 20260813 агуулахгүй.xlsx",
+    "sheet": "TDSheet",
+    "header_row_zero_based": 8,
+    "column_map": {
+      "sku_id": null,
+      "product_name": "Бараа материал",
+      "branch": null,
+      "manufacturer": "Үйлдвэрлэгч",
+      "supplier": "Поставщик",
+      "on_hand": "2026-08-13 | Тоо | Эцсийн үлдэгдэл",
+      "on_order": null,
+      "backorder": null,
+      "snapshot_date": null
+    },
+    "scope": "NETWORK",
+    "rows": 7711
+  },
+  "mapping": {
+    "inventory_rows": 7711,
+    "matched_rows": 5817,
+    "unmatched_rows": 1894,
+    "mapping_rate_rows": 0.7543768642199455,
+    "total_on_hand": 2967961.3989999997,
+    "matched_on_hand": 2855869.162,
+    "mapping_rate_qty": 0.962232582594313,
+    "negative_inventory_rows": 0,
+    "scope": "NETWORK"
+  },
+  "sku_count": 6781,
+  "branch_count": 87,
+  "branch_rop_rows": 133518,
+  "network_rop_total": 797174.0,
+  "corrected_branch_rop_total": 532617.0,
+  "status_counts": {
+    "Илүүдэл": 3998,
+    "Хэвийн": 1009,
+    "Өгөгдөл алга": 968,
+    "ROP-оос доош": 744,
+    "ROP байхгүй": 62
+  },
+  "critical_ve_sku": 380,
+  "rop_gap_total": 117267.685,
+  "on_hand_total_matched": 2855869.162,
+  "missing_inventory_sku": 968,
+  "missing_rop_sku": 149,
+  "low_confidence_rop_sku": 4508,
+  "formula": "CEILING(AvgDemand*MeanLT + MAX(Z_VED,Z_ABCXYZ)*SQRT(MeanLT*DemandSD^2 + AvgDemand^2*LTSD^2),1)",
+  "excess_threshold": 2.0
+}

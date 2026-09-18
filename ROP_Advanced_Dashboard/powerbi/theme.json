@@ -1,0 +1,16 @@
+{
+  "name": "ROP Inventory Control",
+  "dataColors": ["#1F4E5F", "#0F766E", "#2563EB", "#F59E0B", "#F97316", "#B91C1C", "#7C3AED", "#6B7280"],
+  "background": "#F8FAFC",
+  "foreground": "#12263A",
+  "tableAccent": "#1F4E5F",
+  "visualStyles": {
+    "*": {
+      "*": {
+        "title": [{"show": true, "fontFamily": "Segoe UI", "fontSize": 13, "fontColor": {"solid": {"color": "#12263A"}}}],
+        "background": [{"show": true, "color": {"solid": {"color": "#FFFFFF"}}, "transparency": 0}],
+        "border": [{"show": true, "color": {"solid": {"color": "#E5E7EB"}}, "radius": 8}]
+      }
+    }
+  }
+}

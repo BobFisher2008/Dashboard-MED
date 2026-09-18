@@ -1,0 +1,6 @@
+pandas>=2.2
+numpy>=2.0
+openpyxl>=3.1
+pyxlsb>=1.0.10
+bokeh>=3.8
+rapidfuzz>=3.10

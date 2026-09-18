@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated warehouse and business data (rebuild with `python warehouse.py build`)
+data/
+powerbi_data/
+snapshots/
+*.duckdb
+*.tmp
+
+# Source workbooks with company data
+*.xlsb
+*.xlsx
+
+# Local safety copies
+_backup_before_rop_update/
+_backup_before_star_schema/
+
+# Stale generated output
+dashboard_preview.html
+dashboard_preview.png
+QA_REPORT.txt
