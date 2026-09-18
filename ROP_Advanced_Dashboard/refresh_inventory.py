@@ -6,16 +6,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from common import build_status_snapshot, load_project_data, map_inventory, parse_inventory, save_json
-
-
-def write_outputs(frame: pd.DataFrame, project: Path, name: str) -> None:
-    data_dir = project / "data"
-    powerbi_dir = project / "powerbi_data"
-    data_dir.mkdir(exist_ok=True)
-    powerbi_dir.mkdir(exist_ok=True)
-    frame.to_csv(data_dir / f"{name}.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
-    frame.to_csv(powerbi_dir / f"{name}.csv", index=False, encoding="utf-8-sig")
+from common import apply_missing_as_zero, build_status_snapshot, load_project_data, map_inventory, parse_inventory, save_json
+from warehouse import branch_rop_wide, save_snapshot_files, status_tables, write_tables
 
 
 def main() -> None:
@@ -25,40 +17,37 @@ def main() -> None:
     parser.add_argument("--project", default=str(Path(__file__).resolve().parent))
     parser.add_argument("--excess-threshold", type=float, default=2.0)
     parser.add_argument("--missing-as-zero", action="store_true")
+    parser.add_argument("--powerbi", action="store_true", help="Also export readable CSVs to powerbi_data/")
     args = parser.parse_args()
 
     project = Path(args.project)
-    frames = load_project_data(project / "data")
+    data_dir = project / "data"
+    frames = load_project_data(data_dir)
     dim_sku = frames["dim_sku"]
     dim_branch = frames["dim_branch"]
-    fact_branch_rop = frames["fact_branch_rop"]
     alias_mapping = frames["alias_mapping"]
+    rop_wide = branch_rop_wide(frames["fact_branch_rop"], dim_branch, dim_sku)
 
     inventory, parse_meta = parse_inventory(args.inventory)
     inventory["SnapshotDate"] = pd.to_datetime(inventory["SnapshotDate"], errors="coerce").fillna(pd.Timestamp(args.snapshot_date))
     inventory["SourceFile"] = Path(args.inventory).name
     mapped, review, mapping_stats = map_inventory(inventory, alias_mapping, dim_sku, dim_branch)
-    status = build_status_snapshot(dim_sku, mapped, fact_branch_rop, args.snapshot_date, args.excess_threshold)
-
+    status = build_status_snapshot(dim_sku, mapped, rop_wide, args.snapshot_date, args.excess_threshold)
     if args.missing_as_zero:
-        missing = ~status["HasInventory"]
-        status.loc[missing, ["OnHand", "OnOrder", "Backorder", "InventoryPosition"]] = 0.0
-        status.loc[missing, "ROPGap"] = status.loc[missing, "ROP"].clip(lower=0)
-        status.loc[missing, "CoverageRatio"] = 0.0
-        status.loc[missing & (status["ROP"] > 0), "Status"] = "Тасарсан"
-        status.loc[missing & (status["ROP"] <= 0), "Status"] = "ROP байхгүй"
-        status.loc[missing, "DataMatch"] = "Missing treated as zero"
-        status.loc[missing, "HasInventory"] = True
+        status = apply_missing_as_zero(status)
 
     mapped["SnapshotDate"] = pd.to_datetime(mapped["SnapshotDate"], errors="coerce").fillna(pd.Timestamp(args.snapshot_date)).dt.date.astype(str)
+    mapped["DateKey"] = pd.to_datetime(mapped["SnapshotDate"]).dt.strftime("%Y%m%d").astype("int32")
     mapped["Scope"] = mapping_stats["scope"]
     mapped["SourceFile"] = Path(args.inventory).name
 
-    write_outputs(mapped, project, "fact_inventory_snapshot")
-    write_outputs(status, project, "fact_sku_status")
-    write_outputs(review, project, "mapping_review")
+    tables = status_tables(status, dim_branch, mapped, data_dir=data_dir)
+    write_tables(
+        {**tables, "fact_inventory_snapshot": mapped, "mapping_review": review},
+        data_dir=data_dir, powerbi=args.powerbi,
+    )
 
-    metadata_path = project / "data" / "metadata.json"
+    metadata_path = data_dir / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
     metadata.update({
         "snapshot_date": args.snapshot_date,
@@ -72,16 +61,11 @@ def main() -> None:
         "excess_threshold": args.excess_threshold,
         "missing_as_zero": args.missing_as_zero,
         "source_files": {**metadata.get("source_files", {}), "inventory": Path(args.inventory).name},
+        "history_dates": [pd.Timestamp(str(k)).date().isoformat() for k in sorted(tables["fact_status_history"]["DateKey"].unique())],
     })
-    save_json(project / "data" / "metadata.json", metadata)
-    save_json(project / "powerbi_data" / "metadata.json", metadata)
+    save_json(metadata_path, metadata)
 
-    snapshot_dir = project / "snapshots"
-    snapshot_dir.mkdir(exist_ok=True)
-    stamp = args.snapshot_date.replace("-", "")
-    mapped.to_csv(snapshot_dir / f"inventory_{stamp}.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
-    status.to_csv(snapshot_dir / f"status_{stamp}.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
-    review.to_csv(snapshot_dir / f"mapping_review_{stamp}.csv", index=False, encoding="utf-8-sig")
+    save_snapshot_files(mapped, status, review, args.snapshot_date, snapshot_dir=project / "snapshots")
 
     print(json.dumps({
         "snapshot_date": args.snapshot_date,

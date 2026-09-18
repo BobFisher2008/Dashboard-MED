@@ -4,3 +4,6 @@ openpyxl>=3.1
 pyxlsb>=1.0.10
 bokeh>=3.8
 rapidfuzz>=3.10
+duckdb>=1.1
+pyarrow>=15
+pytest>=8

@@ -85,8 +85,8 @@ def clean_category(value: Any) -> str:
     text = str(value).strip()
     if not text or normalize_product_name(text) in {"0X17", "ТОДОРХОЙГҮЙ"}:
         return "Бусад"
-    if normalize_product_name(text) == "ЭКС":
-        return "Экс"
+    if normalize_product_name(text) in {"ЭКС", "ЭКСКЛЮЗИВ"}:
+        return "Эксклюзив"
     return text
 
 
@@ -360,6 +360,46 @@ def classify_status(on_hand: float | None, rop: float | None, excess_threshold: 
     return "Хэвийн"
 
 
+def classify_status_vectorized(
+    on_hand: pd.Series, rop: pd.Series, has_data: pd.Series, excess_threshold: float = 2.0
+) -> np.ndarray:
+    """Array version of ``classify_status`` (same rules, same order)."""
+    on_hand = pd.to_numeric(on_hand, errors="coerce")
+    rop_value = pd.to_numeric(rop, errors="coerce").fillna(0.0)
+    missing = ~has_data.astype(bool) | on_hand.isna()
+    conditions = [
+        missing,
+        rop_value <= 0,
+        on_hand <= 0,
+        on_hand < rop_value,
+        on_hand >= rop_value * excess_threshold,
+    ]
+    choices = ["Өгөгдөл алга", "ROP байхгүй", "Тасарсан", "ROP-оос доош", "Илүүдэл"]
+    return np.select(conditions, choices, default="Хэвийн")
+
+
+def _map_unique(values: pd.Series, func) -> pd.Series:
+    """``values.map(func)`` evaluated once per distinct value (NaN included)."""
+    codes, uniques = pd.factorize(values, use_na_sentinel=False)
+    mapped = np.array([func(u) for u in uniques], dtype=object)
+    return pd.Series(mapped[codes], index=values.index)
+
+
+def excluded_mask(branches: pd.Series) -> pd.Series:
+    return _map_unique(branches, is_excluded_branch).astype(bool)
+
+
+def _join_unique(frame: pd.DataFrame, keys: list[str], col: str, limit: int = 500) -> pd.DataFrame:
+    """'; '-joined sorted distinct non-empty values of ``col`` per key."""
+    vals = frame[keys + [col]].copy()
+    vals[col] = vals[col].astype(str).str.strip()
+    vals = vals[~vals[col].isin(["", "nan", "None", "<NA>"])].drop_duplicates().sort_values(keys + [col])
+    if vals.empty:
+        return pd.DataFrame(columns=keys + [col])
+    joined = vals.groupby(keys, sort=False)[col].agg("; ".join).str[:limit]
+    return joined.reset_index()
+
+
 def build_status_snapshot(
     dim_sku: pd.DataFrame,
     mapped_inventory: pd.DataFrame,
@@ -367,26 +407,24 @@ def build_status_snapshot(
     snapshot_date: str | pd.Timestamp,
     excess_threshold: float = 2.0,
 ) -> pd.DataFrame:
-    mapped_inventory = mapped_inventory.loc[
-        ~mapped_inventory["BranchName"].map(is_excluded_branch)
-    ].copy()
-    fact_branch_rop = fact_branch_rop.loc[
-        ~fact_branch_rop["BranchName"].map(is_excluded_branch)
-    ].copy()
+    mapped_inventory = mapped_inventory.loc[~excluded_mask(mapped_inventory["BranchName"])].copy()
+    fact_branch_rop = fact_branch_rop.loc[~excluded_mask(fact_branch_rop["BranchName"])].copy()
     snapshot_date = pd.Timestamp(snapshot_date).date().isoformat()
     scope = "BRANCH" if (mapped_inventory["BranchName"] != "NETWORK").any() else "NETWORK"
 
     matched = mapped_inventory[mapped_inventory["SKU_ID"].notna()].copy()
     matched["SKU_ID"] = matched["SKU_ID"].astype(int)
-    grouped = matched.groupby(["Branch_ID", "BranchName", "SKU_ID"], as_index=False).agg(
+    keys = ["Branch_ID", "BranchName", "SKU_ID"]
+    grouped = matched.groupby(keys, as_index=False).agg(
         OnHand=("OnHand", "sum"),
         OnOrder=("OnOrder", "sum"),
         Backorder=("Backorder", "sum"),
         InventoryPosition=("InventoryPosition", "sum"),
         InventoryLines=("InventoryLineID", "count"),
-        Manufacturer=("Manufacturer", lambda x: "; ".join(sorted({str(v) for v in x if str(v) not in {"", "nan"}}))[:500]),
-        Supplier=("Supplier", lambda x: "; ".join(sorted({str(v) for v in x if str(v) not in {"", "nan"}}))[:500]),
     )
+    for col in ["Manufacturer", "Supplier"]:
+        grouped = grouped.merge(_join_unique(matched, keys, col), on=keys, how="left")
+        grouped[col] = grouped[col].fillna("")
 
     if scope == "NETWORK":
         base = dim_sku[[
@@ -420,11 +458,10 @@ def build_status_snapshot(
         (status["InventoryPosition"] / status["ROP"]).clip(lower=0, upper=1),
         np.nan,
     )
-    status["Category"] = status["Category"].map(clean_category)
-    status["Status"] = [
-        classify_status(on, rop, excess_threshold=excess_threshold, has_data=has)
-        for on, rop, has in zip(status["InventoryPosition"], status["ROP"], status["OnHand"].notna())
-    ]
+    status["Category"] = _map_unique(status["Category"], clean_category)
+    status["Status"] = classify_status_vectorized(
+        status["InventoryPosition"], status["ROP"], status["OnHand"].notna(), excess_threshold
+    )
     status["WeightedGap"] = status["ROPGap"].fillna(0) * status["VED"].map(VED_WEIGHT).fillna(1.0)
     status["PriorityScore"] = (
         status["Status"].map(STATUS_WEIGHT).fillna(0)
@@ -434,22 +471,110 @@ def build_status_snapshot(
     )
     status["SnapshotDate"] = snapshot_date
     status["Scope"] = scope
-    status["BranchGroup"] = status["BranchName"].map(branch_group)
+    status["BranchGroup"] = _map_unique(status["BranchName"], branch_group)
     status["IsCritical"] = status["Status"].isin(["Тасарсан", "ROP-оос доош"]) & status["VED"].isin(["V", "E"])
     status["HasROP"] = status["ROP"].fillna(0) > 0
     status["HasInventory"] = status["OnHand"].notna()
     return status
 
 
+def apply_missing_as_zero(status: pd.DataFrame) -> pd.DataFrame:
+    """Treat SKU x branch rows without inventory data as zero stock."""
+    status = status.copy()
+    missing = ~status["HasInventory"].fillna(False).astype(bool)
+    status.loc[missing, ["OnHand", "OnOrder", "Backorder", "InventoryPosition"]] = 0.0
+    status.loc[missing, "ROPGap"] = status.loc[missing, "ROP"].clip(lower=0)
+    status.loc[missing, "CoverageRatio"] = np.where(status.loc[missing, "ROP"] > 0, 0.0, np.nan)
+    status.loc[missing & (status["ROP"] > 0), "Status"] = "Тасарсан"
+    status.loc[missing & (status["ROP"] <= 0), "Status"] = "ROP байхгүй"
+    status.loc[missing, "DataMatch"] = "Missing treated as zero"
+    status.loc[missing, "HasInventory"] = True
+    status["IsCritical"] = status["Status"].isin(["Тасарсан", "ROP-оос доош"]) & status["VED"].isin(["V", "E"])
+    return status
+
+
+def load_category_map(
+    path: str | Path,
+    dim_sku: pd.DataFrame,
+    alias_mapping: pd.DataFrame | None = None,
+) -> tuple[pd.Series, pd.DataFrame, dict[str, Any]]:
+    """Map the category source file (product name, category) onto SKU_IDs.
+
+    Names are matched on the normalized key: first against the SKU master
+    key, then against the alias mapping. When one SKU receives more than one
+    category, the most frequent one wins and the conflict is reported.
+    Returns (category by SKU_ID, review rows, stats).
+    """
+    try:
+        raw = pd.read_csv(path, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        raw = pd.read_csv(path, encoding="cp1251")
+    src = pd.DataFrame({
+        "SourceName": raw.iloc[:, 0].astype(str).str.strip(),
+        "SourceCategory": raw.iloc[:, 1].map(clean_category),
+    })
+    src["NormalizedKey"] = src["SourceName"].map(normalize_product_name)
+    source_rows = len(src)
+
+    master = dim_sku[["MasterKey", "SKU_ID"]].dropna().astype({"MasterKey": str})
+    src = src.merge(master.rename(columns={"MasterKey": "NormalizedKey"}), on="NormalizedKey", how="left")
+    src["MatchType"] = np.where(src["SKU_ID"].notna(), "Master key", "Unmatched")
+    if alias_mapping is not None and len(alias_mapping):
+        alias = alias_mapping.dropna(subset=["NormalizedKey", "SKU_ID"]).drop_duplicates("NormalizedKey")
+        alias_map = alias.set_index(alias["NormalizedKey"].astype(str))["SKU_ID"]
+        via_alias = src["SKU_ID"].isna() & src["NormalizedKey"].isin(alias_map.index)
+        src.loc[via_alias, "SKU_ID"] = src.loc[via_alias, "NormalizedKey"].map(alias_map)
+        src.loc[via_alias, "MatchType"] = "Alias"
+    src["SKU_ID"] = pd.to_numeric(src["SKU_ID"], errors="coerce").astype("Int64")
+
+    matched = src[src["SKU_ID"].notna()]
+    category = matched.groupby("SKU_ID")["SourceCategory"].agg(lambda x: x.value_counts().index[0])
+    conflicts = matched.groupby("SKU_ID")["SourceCategory"].nunique()
+    conflict_ids = set(conflicts[conflicts > 1].index)
+
+    review = src[src["SKU_ID"].isna()].assign(Issue="Эх файлын нэр SKU-тэй таарсангүй")
+    conflict_rows = matched[matched["SKU_ID"].isin(conflict_ids)].assign(Issue="Олон категори — давамгайг сонгов")
+    uncovered = dim_sku.loc[~dim_sku["SKU_ID"].isin(category.index), ["SKU_ID", "SKU_Name", "Category"]]
+    uncovered = uncovered.rename(columns={"SKU_Name": "SourceName", "Category": "SourceCategory"})
+    uncovered = uncovered.assign(Issue="SKU категори файлд алга — хуучин категори хэвээр")
+    review = pd.concat([review, conflict_rows, uncovered], ignore_index=True)[
+        ["Issue", "SourceName", "SourceCategory", "SKU_ID", "NormalizedKey", "MatchType"]
+    ]
+    stats = {
+        "source_rows": int(source_rows),
+        "matched_rows": int(src.loc[src["SKU_ID"].notna(), "SourceName"].nunique()),
+        "unmatched_rows": int(src["SKU_ID"].isna().sum()),
+        "sku_covered": int(len(category)),
+        "sku_uncovered": int(len(uncovered)),
+        "sku_conflicts": int(len(conflict_ids)),
+    }
+    return category, review, stats
+
+
+def apply_category_map(dim_sku: pd.DataFrame, category_by_sku: pd.Series) -> pd.DataFrame:
+    dim_sku = dim_sku.copy()
+    mapped = pd.to_numeric(dim_sku["SKU_ID"], errors="coerce").map(category_by_sku)
+    dim_sku["Category"] = mapped.fillna(dim_sku["Category"]).map(clean_category)
+    return dim_sku
+
+
 def load_project_data(data_dir: str | Path) -> dict[str, pd.DataFrame]:
     data_dir = Path(data_dir)
     frames = {}
-    for name in ["dim_sku", "dim_branch", "fact_branch_rop", "fact_inventory_snapshot", "fact_sku_status", "alias_mapping", "mapping_review"]:
+    for name in [
+        "dim_sku", "dim_branch", "dim_date", "dim_status", "dim_ved", "dim_category",
+        "fact_branch_rop", "fact_inventory_snapshot", "fact_sku_status", "fact_status_history",
+        "alias_mapping", "mapping_review",
+    ]:
+        parquet = data_dir / f"{name}.parquet"
         path_gz = data_dir / f"{name}.csv.gz"
         path_csv = data_dir / f"{name}.csv"
-        path = path_gz if path_gz.exists() else path_csv
-        if path.exists():
-            frames[name] = pd.read_csv(path, low_memory=False)
+        if parquet.exists():
+            frames[name] = pd.read_parquet(parquet)
+        elif path_gz.exists():
+            frames[name] = pd.read_csv(path_gz, low_memory=False)
+        elif path_csv.exists():
+            frames[name] = pd.read_csv(path_csv, low_memory=False)
     return frames
 
 

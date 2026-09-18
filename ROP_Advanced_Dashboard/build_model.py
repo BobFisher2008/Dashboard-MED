@@ -9,13 +9,18 @@ import pandas as pd
 
 from common import (
     VED_Z,
+    apply_category_map,
     branch_group,
     build_status_snapshot,
+    clean_category,
+    is_excluded_branch,
+    load_category_map,
     map_inventory,
     normalize_product_name,
     parse_inventory,
     save_json,
 )
+from warehouse import DATA_DICTIONARY, build_static_dims, status_tables, to_fact_branch_rop, write_tables
 
 
 def load_rop_master(v1_workbook: str | Path) -> pd.DataFrame:
@@ -123,46 +128,28 @@ def load_branch_rop(rop_workbook: str | Path, dim_sku: pd.DataFrame) -> tuple[pd
     return fact, dim_branch
 
 
-def build_dim_date(snapshot_date: str) -> pd.DataFrame:
-    center = pd.Timestamp(snapshot_date)
-    start = (center - pd.DateOffset(years=2)).normalize()
-    end = (center + pd.DateOffset(years=2)).normalize()
-    dates = pd.date_range(start, end, freq="D")
-    df = pd.DataFrame({"Date": dates})
-    df["DateKey"] = df["Date"].dt.strftime("%Y%m%d").astype(int)
-    df["Year"] = df["Date"].dt.year
-    df["Quarter"] = "Q" + df["Date"].dt.quarter.astype(str)
-    df["MonthNo"] = df["Date"].dt.month
-    df["Month"] = df["Date"].dt.strftime("%Y-%m")
-    df["MonthName"] = df["Date"].dt.month_name()
-    df["Week"] = df["Date"].dt.isocalendar().week.astype(int)
-    df["Day"] = df["Date"].dt.day
-    return df
-
-
-def write_csv(frame: pd.DataFrame, data_dir: Path, powerbi_dir: Path, name: str) -> None:
-    frame.to_csv(data_dir / f"{name}.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
-    frame.to_csv(powerbi_dir / f"{name}.csv", index=False, encoding="utf-8-sig")
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build the ROP advanced dashboard star schema.")
+    parser = argparse.ArgumentParser(description="Build the ROP advanced dashboard star schema from the source workbooks.")
     parser.add_argument("--rop", default="/mnt/data/ROP тооцоолол.xlsb")
     parser.add_argument("--v1", default="/mnt/data/ROP_үлдэгдэл_автомат_дашбоард_v1.xlsx")
     parser.add_argument("--inventory", default="/mnt/data/Үлд 20260813 агуулахгүй.xlsx")
     parser.add_argument("--snapshot-date", default="2026-08-13")
     parser.add_argument("--output", default=str(Path(__file__).resolve().parent))
     parser.add_argument("--excess-threshold", type=float, default=2.0)
+    parser.add_argument("--categories", type=Path, default=None, help="CSV: product name, category")
+    parser.add_argument("--powerbi", action="store_true", help="Also export readable CSVs to powerbi_data/")
     args = parser.parse_args()
 
-    out = Path(args.output)
-    data_dir = out / "data"
-    powerbi_dir = out / "powerbi_data"
+    data_dir = Path(args.output) / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    powerbi_dir.mkdir(parents=True, exist_ok=True)
 
     dim_sku = load_rop_master(args.v1)
     alias = load_alias_mapping(args.v1)
+    category_stats = None
+    if args.categories is not None:
+        category_by_sku, category_review, category_stats = load_category_map(args.categories, dim_sku, alias)
+        dim_sku = apply_category_map(dim_sku, category_by_sku)
+        category_review.to_csv(data_dir / "category_review.csv", index=False, encoding="utf-8-sig")
     fact_branch_rop, dim_branch = load_branch_rop(args.rop, dim_sku)
     inventory, inventory_meta = parse_inventory(args.inventory)
     inventory["SnapshotDate"] = pd.to_datetime(inventory["SnapshotDate"], errors="coerce").fillna(pd.Timestamp(args.snapshot_date))
@@ -172,51 +159,22 @@ def main() -> None:
 
     fact_inventory = mapped.copy()
     fact_inventory["SnapshotDate"] = pd.to_datetime(fact_inventory["SnapshotDate"], errors="coerce").fillna(pd.Timestamp(args.snapshot_date)).dt.date.astype(str)
+    fact_inventory["DateKey"] = pd.to_datetime(fact_inventory["SnapshotDate"]).dt.strftime("%Y%m%d").astype("int32")
     fact_inventory["Scope"] = mapping_stats["scope"]
     fact_inventory["SourceFile"] = Path(args.inventory).name
 
-    dim_status = pd.DataFrame({
-        "Status": ["Тасарсан", "ROP-оос доош", "Өгөгдөл алга", "ROP байхгүй", "Хэвийн", "Илүүдэл"],
-        "StatusOrder": [1, 2, 3, 4, 5, 6],
-        "StatusGroup": ["Эрсдэл", "Эрсдэл", "Өгөгдлийн чанар", "Өгөгдлийн чанар", "Хэвийн", "Илүүдэл"],
-    })
-    dim_ved = pd.DataFrame({
-        "VED": ["V", "E", "D", "Тодорхойгүй"],
-        "VEDOrder": [1, 2, 3, 4],
-        "ServiceLevel": [0.99, 0.96, 0.88, np.nan],
-        "Z": [2.326, 1.751, 1.175, np.nan],
-        "Criticality": ["Vital", "Essential", "Desirable", "Unknown"],
-    })
-    dim_date = build_dim_date(args.snapshot_date)
-
-    # A concise data dictionary for Power BI and Python users.
-    dictionary_rows = [
-        ("DimSKU", "SKU_ID", "SKU master key"),
-        ("DimSKU", "ROP_Used", "Network-level working ROP; corrected detail where available, fallback otherwise"),
-        ("FactBranchROP", "ROP", "Corrected branch ROP using demand and lead-time variability"),
-        ("FactInventorySnapshot", "InventoryPosition", "OnHand + OnOrder - Backorder"),
-        ("FactSKUStatus", "ROPGap", "MAX(ROP - InventoryPosition, 0)"),
-        ("FactSKUStatus", "Status", "Stockout / below ROP / normal / excess / missing data / missing ROP"),
-        ("FactSKUStatus", "WeightedGap", "ROPGap weighted by VED criticality"),
-        ("FactSKUStatus", "PriorityScore", "Operational prioritization score"),
-    ]
-    data_dictionary = pd.DataFrame(dictionary_rows, columns=["Table", "Field", "Definition"])
-
+    tables = status_tables(status, dim_branch, fact_branch_rop, fact_inventory, data_dir=data_dir)
     frames = {
+        **tables,
         "dim_sku": dim_sku,
-        "dim_branch": dim_branch,
-        "dim_date": dim_date,
-        "dim_status": dim_status,
-        "dim_ved": dim_ved,
-        "fact_branch_rop": fact_branch_rop,
+        **build_static_dims(dim_sku),
+        "fact_branch_rop": to_fact_branch_rop(fact_branch_rop),
         "fact_inventory_snapshot": fact_inventory,
-        "fact_sku_status": status,
         "alias_mapping": alias,
         "mapping_review": mapping_review,
-        "data_dictionary": data_dictionary,
+        "data_dictionary": DATA_DICTIONARY,
     }
-    for name, frame in frames.items():
-        write_csv(frame, data_dir, powerbi_dir, name)
+    write_tables(frames, data_dir=data_dir, powerbi=args.powerbi)
 
     metrics = {
         "snapshot_date": args.snapshot_date,
@@ -228,10 +186,10 @@ def main() -> None:
         "inventory_parser": inventory_meta,
         "mapping": mapping_stats,
         "sku_count": int(len(dim_sku)),
-        "branch_count": int((~dim_branch["IsNetwork"]).sum()),
-        "branch_rop_rows": int(len(fact_branch_rop)),
+        "branch_count": int((~tables["dim_branch"]["IsNetwork"]).sum()),
+        "branch_rop_rows": int(len(frames["fact_branch_rop"])),
         "network_rop_total": float(dim_sku["ROP_Used"].sum()),
-        "corrected_branch_rop_total": float(fact_branch_rop["ROP"].sum()),
+        "corrected_branch_rop_total": float(frames["fact_branch_rop"]["ROP"].sum()),
         "status_counts": {str(k): int(v) for k, v in status["Status"].value_counts().to_dict().items()},
         "critical_ve_sku": int(status["IsCritical"].sum()),
         "rop_gap_total": float(status["ROPGap"].sum(skipna=True)),
@@ -242,8 +200,9 @@ def main() -> None:
         "formula": "CEILING(AvgDemand*MeanLT + MAX(Z_VED,Z_ABCXYZ)*SQRT(MeanLT*DemandSD^2 + AvgDemand^2*LTSD^2),1)",
         "excess_threshold": args.excess_threshold,
     }
+    if category_stats is not None:
+        metrics["categories"] = {"source_file": Path(args.categories).name, **category_stats}
     save_json(data_dir / "metadata.json", metrics)
-    save_json(powerbi_dir / "metadata.json", metrics)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
 

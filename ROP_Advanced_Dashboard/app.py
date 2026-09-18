@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import base64
-import io
 import json
 from datetime import date
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -27,6 +25,7 @@ from bokeh.models import (
     LinearColorMapper,
     MultiChoice,
     NumberFormatter,
+    NumeralTickFormatter,
     Select,
     Slider,
     StringFormatter,
@@ -35,51 +34,46 @@ from bokeh.models import (
     Tabs,
     TextInput,
 )
-from bokeh.palettes import Category10, Viridis256
+from bokeh.palettes import Viridis256
 from bokeh.plotting import figure
 from bokeh.transform import cumsum
-from bokeh.util.hex import hexbin
 
 from common import (
     STATUS_ORDER,
     VED_ORDER,
+    apply_missing_as_zero,
     build_status_snapshot,
-    clean_category,
-    is_excluded_branch,
-    load_project_data,
     map_inventory,
     parse_inventory,
 )
+from metrics import MetricsCalculator
+from queries import DashboardQuery, Filters
+from warehouse import (
+    DATA_DIR,
+    RISK_STATUSES,
+    branch_rop_wide,
+    build_dim_date,
+    connect,
+    ensure_branches,
+    save_snapshot_files,
+    to_fact_status,
+    upsert_history,
+    write_tables,
+)
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-SNAPSHOT_DIR = BASE_DIR / "snapshots"
-SNAPSHOT_DIR.mkdir(exist_ok=True)
-
-frames = load_project_data(DATA_DIR)
-dim_sku = frames["dim_sku"].copy()
-dim_branch = frames["dim_branch"].copy()
-fact_branch_rop = frames["fact_branch_rop"].copy()
-alias_mapping = frames["alias_mapping"].copy()
-current_inventory = frames.get("fact_inventory_snapshot", pd.DataFrame()).copy()
-current_status = frames.get("fact_sku_status", pd.DataFrame()).copy()
-current_mapping_review = frames.get("mapping_review", pd.DataFrame()).copy()
+# --------------------------------------------------------------------------
+# Data: in-memory DuckDB star schema + the pandas frames the ETL needs
+# --------------------------------------------------------------------------
+db = DashboardQuery(connect(DATA_DIR))
 metadata = json.loads((DATA_DIR / "metadata.json").read_text(encoding="utf-8"))
 
-# Normalize loaded dtypes.
-dim_sku["Category"] = dim_sku["Category"].map(clean_category)
-fact_branch_rop["Category"] = fact_branch_rop["Category"].map(clean_category)
-current_status["Category"] = current_status["Category"].map(clean_category)
-dim_branch = dim_branch.loc[~dim_branch["BranchName"].map(is_excluded_branch)].copy()
-fact_branch_rop = fact_branch_rop.loc[~fact_branch_rop["BranchName"].map(is_excluded_branch)].copy()
-current_inventory = current_inventory.loc[~current_inventory["BranchName"].map(is_excluded_branch)].copy()
-current_status = current_status.loc[~current_status["BranchName"].map(is_excluded_branch)].copy()
-for frame in [dim_sku, fact_branch_rop, current_inventory, current_status]:
-    if "SKU_ID" in frame:
-        frame["SKU_ID"] = pd.to_numeric(frame["SKU_ID"], errors="coerce").astype("Int64")
-for col in ["OnHand", "OnOrder", "Backorder", "InventoryPosition", "ROP", "ROPGap", "CoverageRatio", "WeightedGap", "PriorityScore"]:
-    if col in current_status:
-        current_status[col] = pd.to_numeric(current_status[col], errors="coerce")
+dim_sku = db.table_frame("dim_sku")
+dim_branch = db.table_frame("dim_branch")
+fact_branch_rop = db.table_frame("fact_branch_rop")
+alias_mapping = db.table_frame("alias_mapping")
+initial_status = db.table_frame("fact_sku_status")
+initial_inventory = db.table_frame("fact_inventory_snapshot")
+initial_mapping_review = db.table_frame("mapping_review")
 
 STATUS_COLORS = {
     "Тасарсан": "#B91C1C",
@@ -93,10 +87,9 @@ VED_COLORS = {"V": "#B91C1C", "E": "#F59E0B", "D": "#0F766E", "Тодорхой�
 HEX_SIZE = 0.12  # bin width in log10 units for the ROP-vs-inventory density plot
 
 state = {
-    "inventory": current_inventory,
-    "status": current_status,
-    "mapping_review": current_mapping_review,
-    "scope": str(current_status["Scope"].dropna().iloc[0]) if len(current_status) and "Scope" in current_status else "NETWORK",
+    "inventory": initial_inventory,
+    "status_wide": None,  # wide status of the last upload, for the snapshot file
+    "mapping_review": initial_mapping_review,
     "source_file": metadata.get("source_files", {}).get("inventory", "Initial snapshot"),
     "mapping_stats": metadata.get("mapping", {}),
 }
@@ -104,7 +97,7 @@ state = {
 TITLE_CSS = """
 <div style="font-family:Segoe UI,Arial,sans-serif;background:linear-gradient(90deg,#12263A,#1F4E5F);color:white;padding:18px 24px;border-radius:12px;">
   <div style="font-size:26px;font-weight:700;">ROP & Нөөцийн удирдлагын ахисан түвшний дашбоард</div>
-  <div style="font-size:13px;opacity:.88;margin-top:4px;">Python ETL + интерактив хяналт + Power BI-ready star schema</div>
+  <div style="font-size:13px;opacity:.88;margin-top:4px;">Python ETL + DuckDB star schema + интерактив хяналт</div>
 </div>
 """
 header = Div(text=TITLE_CSS, sizing_mode="stretch_width", height=92)
@@ -119,14 +112,14 @@ clear_filters_button = Button(label="Шүүлтүүр цэвэрлэх", button_
 critical_only = CheckboxGroup(labels=["Зөвхөн эрсдэлтэй (Тасарсан / ROP-оос доош)"], active=[], width=320)
 message = Div(text="", width=600, height=55)
 
+options = db.filter_options()
 status_filter = MultiChoice(title="Status", value=[], options=STATUS_ORDER, width=260)
 ved_filter = MultiChoice(title="VED", value=[], options=VED_ORDER, width=220)
-category_options = sorted(str(x) for x in dim_sku["Category"].dropna().unique())
-category_filter = MultiChoice(title="Категори", value=[], options=category_options, width=260)
-confidence_filter = MultiChoice(title="ROP confidence", value=[], options=["Өндөр", "Бага"], width=200)
-branch_filter = Select(title="Салбар", value="ALL", options=["ALL"] + sorted(str(x) for x in current_status.get("BranchName", pd.Series(["NETWORK"])).dropna().unique()), width=300)
+category_filter = MultiChoice(title="Категори", value=[], options=options["categories"], width=260)
+confidence_filter = MultiChoice(title="ROP confidence", value=[], options=options["confidences"], width=200)
+branch_filter = Select(title="Салбар", value="ALL", options=["ALL"] + options["branches"], width=300)
 search_input = TextInput(title="Барааны нэр хайх", placeholder="жишээ: Тобрекс", width=320)
-min_gap_slider = Slider(title="Доод ROP gap", start=0, end=max(1000, float(current_status.get("ROPGap", pd.Series([0])).max(skipna=True) or 0)), value=0, step=1, width=240)
+min_gap_slider = Slider(title="Доод ROP gap", start=0, end=max(1000, db.max_gap()), value=0, step=1, width=240)
 
 kpi_container = Div(text="", sizing_mode="stretch_width", height=135)
 status_source = ColumnDataSource(data=dict(Status=[], Count=[], Angle=[], Color=[]))
@@ -134,13 +127,15 @@ ved_source = ColumnDataSource(data=dict(VED=[], Critical=[], Gap=[], Color=[]))
 top_source = ColumnDataSource(data=dict(Name=[], Label=[], Branch=[], Gap=[], WeightedGap=[], VED=[], Status=[], OnHand=[], ROP=[], Color=[]))
 scatter_source = ColumnDataSource(data=dict(Name=[], ROPPlot=[], InvPlot=[], ROP=[], Inventory=[], Gap=[], VED=[], Status=[], Color=[]))
 hex_source = ColumnDataSource(data=dict(q=[], r=[], counts=[]))
-branch_source = ColumnDataSource(data=dict(Branch=[], ROP=[], VROP=[], EROP=[], DROP=[], Color=[]))
+branch_source = ColumnDataSource(data=dict(Branch=[], ROP=[], VROP=[], EROP=[], DROP=[]))
 coverage_source = ColumnDataSource(data=dict(
     Branch=[], Category=[], Coverage=[], SKUCount=[], CoveredSKU=[], ROP=[], Inventory=[], Gap=[],
 ))
 quality_source = ColumnDataSource(data=dict(Metric=[], Value=[], Label=[], Color=[]))
 table_source = ColumnDataSource(data=dict())
 review_source = ColumnDataSource(data=dict())
+trend_source = ColumnDataSource(data={"DateLabel": [], "Risk": [], "Critical": [], "Gap": [], "Total": [], **{s: [] for s in STATUS_ORDER}})
+movement_source = ColumnDataSource(data=dict())
 
 
 def empty_figure(title: str, height: int = 360):
@@ -320,7 +315,73 @@ accept_button = Button(label="Зөвшөөрөх (alias нэмэх)", button_typ
 reject_button = Button(label="Татгалзах", button_type="default", width=120)
 review_message = Div(text="", width=520, height=30)
 
-for _c in main_table.columns + review_table.columns:
+# --- Trend tab --------------------------------------------------------------
+trend_include_network = CheckboxGroup(labels=["Сүлжээний (NETWORK) snapshot-ийг оруулах"], active=[], width=320)
+movement_from = Select(title="Харьцуулах: эхний огноо", value="", options=[], width=220)
+movement_to = Select(title="Сүүлийн огноо", value="", options=[], width=220)
+trend_summary = Div(text="", sizing_mode="stretch_width", height=120)
+movement_summary_div = Div(text="", sizing_mode="stretch_width")
+
+trend_mix_plot = figure(
+    title="Status бүтэц — snapshot бүрээр (%)", x_range=FactorRange(), height=400,
+    sizing_mode="stretch_width", toolbar_location="above",
+)
+trend_mix_renderers = trend_mix_plot.vbar_stack(
+    STATUS_ORDER, x="DateLabel", width=0.7, source=trend_source,
+    color=[STATUS_COLORS[s] for s in STATUS_ORDER], legend_label=STATUS_ORDER,
+)
+trend_mix_plot.add_tools(HoverTool(tooltips=[("Огноо", "@DateLabel"), ("Status", "$name"), ("Хувь", "@$name{0.0%}")]))
+trend_mix_plot.y_range.start = 0
+trend_mix_plot.y_range.end = 1
+trend_mix_plot.yaxis.formatter = NumeralTickFormatter(format="0%")
+trend_mix_plot.legend.location = "top_left"
+trend_mix_plot.legend.orientation = "horizontal"
+trend_mix_plot.legend.click_policy = "hide"
+trend_mix_plot.legend.label_text_font_size = "9pt"
+trend_mix_plot.add_layout(trend_mix_plot.legend[0], "below")
+trend_mix_plot.xgrid.grid_line_color = None
+
+trend_risk_plot = figure(
+    title="Эрсдэлтэй SKU, critical V/E ба ROP gap", x_range=trend_mix_plot.x_range, height=380,
+    sizing_mode="stretch_width", toolbar_location="above",
+)
+risk_line = trend_risk_plot.line(x="DateLabel", y="Risk", source=trend_source, color=STATUS_COLORS["ROP-оос доош"], line_width=2.5, legend_label="Эрсдэлтэй (Тасарсан + ROP-оос доош)")
+trend_risk_plot.scatter(x="DateLabel", y="Risk", source=trend_source, color=STATUS_COLORS["ROP-оос доош"], size=8)
+critical_line = trend_risk_plot.line(x="DateLabel", y="Critical", source=trend_source, color=VED_COLORS["V"], line_width=2.5, legend_label="Critical V/E")
+trend_risk_plot.scatter(x="DateLabel", y="Critical", source=trend_source, color=VED_COLORS["V"], size=8)
+trend_risk_plot.extra_y_ranges = {"gap": DataRange1d(start=0)}
+trend_risk_plot.add_layout(LinearAxis(y_range_name="gap", axis_label="ROP gap", formatter=NumeralTickFormatter(format="0,0")), "right")
+gap_line = trend_risk_plot.line(x="DateLabel", y="Gap", source=trend_source, y_range_name="gap", color="#111827", line_dash="dashed", line_width=2, legend_label="ROP gap")
+trend_risk_plot.y_range = DataRange1d(start=0, renderers=[risk_line, critical_line])
+trend_risk_plot.extra_y_ranges["gap"].renderers = [gap_line]
+trend_risk_plot.add_tools(HoverTool(tooltips=[
+    ("Огноо", "@DateLabel"), ("Эрсдэлтэй", "@Risk{0,0}"), ("Critical V/E", "@Critical{0,0}"),
+    ("ROP gap", "@Gap{0,0}"), ("Нийт мөр", "@Total{0,0}"),
+], renderers=[risk_line], mode="vline"))
+trend_risk_plot.yaxis[0].axis_label = "SKU × салбар"
+trend_risk_plot.yaxis[0].formatter = NumeralTickFormatter(format="0,0")
+trend_risk_plot.legend.location = "top_right"
+trend_risk_plot.legend.label_text_font_size = "9pt"
+trend_risk_plot.legend.background_fill_alpha = 0.7
+trend_risk_plot.xgrid.grid_line_color = None
+
+movement_columns = [
+    TableColumn(field="Direction", title="Чиглэл", width=95),
+    TableColumn(field="SKU_ID", title="SKU ID", formatter=NumberFormatter(format="0"), width=70),
+    TableColumn(field="SKU_Name", title="Нэр төрөл", width=300),
+    TableColumn(field="BranchName", title="Салбар", width=220),
+    TableColumn(field="VED", title="VED", width=50),
+    TableColumn(field="Category", title="Категори", width=90),
+    TableColumn(field="StatusFrom", title="Өмнө", width=110),
+    TableColumn(field="StatusTo", title="Одоо", width=110),
+    TableColumn(field="InventoryFrom", title="Inventory өмнө", formatter=NumberFormatter(format="0,0.00"), width=105),
+    TableColumn(field="InventoryTo", title="Inventory одоо", formatter=NumberFormatter(format="0,0.00"), width=105),
+    TableColumn(field="ROP", title="ROP", formatter=NumberFormatter(format="0,0"), width=70),
+    TableColumn(field="ROPGap", title="Gap", formatter=NumberFormatter(format="0,0.00"), width=80),
+]
+movement_table = DataTable(source=movement_source, columns=movement_columns, height=480, sizing_mode="stretch_width", index_position=None)
+
+for _c in main_table.columns + review_table.columns + movement_table.columns:
     _c.sortable = True
 
 methodology = Div(text="""
@@ -333,6 +394,12 @@ methodology = Div(text="""
 <li>Status: тасарсан, ROP-оос доош, хэвийн, илүүдэл, өгөгдөл алга, ROP байхгүй</li>
 <li>Дэлгэрэнгүй ROP байхгүй SKU-д fallback ROP хадгалсан бөгөөд confidence = “Бага”.</li>
 </ul>
+<h3 style="color:#12263A;">Өгөгдлийн загвар (star schema)</h3>
+<p>Өгөгдөл <code>data/*.parquet</code> файлд хадгалагдаж, DuckDB-ээр SQL-ээр шүүгдэнэ.
+Fact хүснэгтүүд (<code>fact_sku_status</code>, <code>fact_status_history</code>, <code>fact_branch_rop</code>) зөвхөн түлхүүр ба хэмжигдэхүүн агуулна;
+барааны нэр, категори, салбарын нэр зэрэг тайлбар мэдээлэл <code>dim_sku</code>, <code>dim_branch</code>, <code>dim_date</code> хүснэгтээс холбогдоно.
+Категори нь <code>SKU category.csv</code> файлаас авна; тохирохгүй SKU-г <code>data/category_review.csv</code>-д жагсаана.
+Snapshot бүр <code>fact_status_history</code>-д огноогоор (DateKey) хадгалагдаж, «Тренд» табад харагдана.</p>
 <h3 style="color:#12263A;">Автомат шинэчлэл</h3>
 <p>Үлдэгдлийн XLSX/XLSB/CSV файлыг дээрх upload хэсэгт оруулахад Python ETL нэр, SKU ID, салбар, үлдэгдлийн багануудыг таньж, alias mapping ашиглан холбож, статус болон бүх графикийг шинэчилнэ.</p>
 </div>
@@ -348,45 +415,28 @@ def card(label: str, value: str, subtitle: str, accent: str) -> str:
     </div>"""
 
 
-def filtered_status() -> pd.DataFrame:
-    df = state["status"].copy()
-    if status_filter.value:
-        df = df[df["Status"].isin(status_filter.value)]
-    if ved_filter.value:
-        df = df[df["VED"].isin(ved_filter.value)]
-    if category_filter.value:
-        df = df[df["Category"].isin(category_filter.value)]
-    if confidence_filter.value:
-        df = df[df["ROP_Confidence"].isin(confidence_filter.value)]
-    if branch_filter.value != "ALL" and "BranchName" in df:
-        df = df[df["BranchName"] == branch_filter.value]
-    if critical_only.active:
-        df = df[df["Status"].isin(["Тасарсан", "ROP-оос доош"])]
-    if search_input.value.strip():
-        term = search_input.value.strip().casefold()
-        mask = df["SKU_Name"].astype(str).str.casefold().str.contains(term, regex=False)
-        for col in ["SKU_ID", "Supplier", "Manufacturer", "BranchName"]:
-            if col in df:
-                mask |= df[col].astype(str).str.casefold().str.contains(term, regex=False)
-        df = df[mask]
-    if min_gap_slider.value > 0:
-        df = df[df["ROPGap"].fillna(0) >= min_gap_slider.value]
-    return df
+def current_filters() -> Filters:
+    return Filters(
+        statuses=tuple(status_filter.value),
+        veds=tuple(ved_filter.value),
+        categories=tuple(category_filter.value),
+        confidences=tuple(confidence_filter.value),
+        branch=None if branch_filter.value == "ALL" else branch_filter.value,
+        critical_only=bool(critical_only.active),
+        search=search_input.value or "",
+        min_gap=float(min_gap_slider.value or 0),
+    )
 
 
-def update_kpis(df: pd.DataFrame) -> None:
-    total_sku = df["SKU_ID"].nunique() if len(df) else 0
-    on_hand = df["InventoryPosition"].sum(skipna=True) if len(df) else 0
-    total_rop = df["ROP"].sum(skipna=True) if len(df) else 0
-    gap = df["ROPGap"].sum(skipna=True) if len(df) else 0
-    critical = int(df.get("IsCritical", pd.Series(dtype=bool)).fillna(False).sum()) if len(df) else 0
+def update_kpis(f: Filters) -> None:
+    k = db.kpis(f)
     mapping_rate = state.get("mapping_stats", {}).get("mapping_rate_rows", 0)
     html = '<div style="display:flex;gap:12px;flex-wrap:wrap;width:100%;box-sizing:border-box;font-family:Segoe UI,Arial,sans-serif;">'
-    html += card("Шүүсэн SKU", f"{total_sku:,.0f}", f"Scope: {state['scope']}", "#1F4E5F")
-    html += card("Inventory Position", f"{on_hand:,.0f}", "Matched inventory", "#2563EB")
-    html += card("Total ROP", f"{total_rop:,.0f}", "Ашиглах ROP", "#0F766E")
-    html += card("ROP gap", f"{gap:,.0f}", "Нөхөх шаардлагатай", "#F97316")
-    html += card("Critical V/E", f"{critical:,.0f}", "Тасарсан эсвэл ROP-оос доош", "#B91C1C")
+    html += card("Шүүсэн SKU", f"{k['sku_count']:,.0f}", f"Scope: {db.scope()}", "#1F4E5F")
+    html += card("Inventory Position", f"{k['inventory_position']:,.0f}", "Matched inventory", "#2563EB")
+    html += card("Total ROP", f"{k['total_rop']:,.0f}", "Ашиглах ROP", "#0F766E")
+    html += card("ROP gap", f"{k['rop_gap']:,.0f}", "Нөхөх шаардлагатай", "#F97316")
+    html += card("Critical V/E", f"{k['critical']:,.0f}", "Тасарсан эсвэл ROP-оос доош", "#B91C1C")
     html += card("Mapping rate", f"{mapping_rate:.1%}", state.get("source_file", ""), "#7C3AED")
     html += "</div>"
     kpi_container.text = html
@@ -394,23 +444,21 @@ def update_kpis(df: pd.DataFrame) -> None:
 
 def update_freshness() -> None:
     snapshot = str(snapshot_picker.value or metadata.get("snapshot_date", ""))
-    src = state.get("source_file", "")
-    mapping = state.get("mapping_stats", {})
-    rate = mapping.get("mapping_rate_rows", 0)
+    rate = state.get("mapping_stats", {}).get("mapping_rate_rows", 0)
     freshness_banner.text = (
         '<div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;'
         'font-family:Segoe UI,Arial,sans-serif;font-size:12.5px;color:#374151;'
         'padding:8px 14px;background:#F3F4F6;border-radius:8px;margin-top:8px;">'
         f'<span><b style="color:#12263A;">Сүүлийн шинэчлэл:</b> {snapshot}</span>'
-        f'<span><b style="color:#12263A;">Эх файл:</b> {src}</span>'
+        f'<span><b style="color:#12263A;">Эх файл:</b> {state.get("source_file", "")}</span>'
         f'<span><b style="color:#12263A;">Mapping:</b> {rate:.1%}</span>'
-        f'<span><b style="color:#12263A;">Scope:</b> {state["scope"]}</span>'
+        f'<span><b style="color:#12263A;">Scope:</b> {db.scope()}</span>'
         '</div>'
     )
 
 
-def update_status_chart(df: pd.DataFrame) -> None:
-    counts = df["Status"].value_counts().reindex(STATUS_ORDER, fill_value=0)
+def update_status_chart(f: Filters) -> None:
+    counts = db.status_counts(f)
     total = max(int(counts.sum()), 1)
     status_source.data = {
         "Status": list(counts.index),
@@ -420,47 +468,21 @@ def update_status_chart(df: pd.DataFrame) -> None:
     }
 
 
-def update_ved_chart(df: pd.DataFrame) -> None:
-    grouped = []
-    for ved in VED_ORDER:
-        sub = df[df["VED"] == ved]
-        critical = int(sub["Status"].isin(["Тасарсан", "ROP-оос доош"]).sum())
-        gap = float(sub["ROPGap"].sum(skipna=True))
-        grouped.append((ved, critical, gap, VED_COLORS[ved]))
+def update_ved_chart(f: Filters) -> None:
+    ved = db.ved_summary(f)
     ved_source.data = {
-        "VED": [x[0] for x in grouped],
-        "Critical": [x[1] for x in grouped],
-        "Gap": [x[2] for x in grouped],
-        "Color": [x[3] for x in grouped],
+        "VED": ved["VED"].tolist(),
+        "Critical": ved["Critical"].astype(int).tolist(),
+        "Gap": ved["Gap"].astype(float).tolist(),
+        "Color": [VED_COLORS[v] for v in ved["VED"]],
     }
 
 
-def _unique_bar_labels(names: list[str], hints: list[str]) -> list[str]:
-    """Bokeh's categorical FactorRange requires every axis label to be
-    unique. When the same product name repeats (e.g. the same SKU is
-    critically low at more than one branch), disambiguate by appending the
-    branch name; if that still collides (or there's no branch), fall back
-    to a numeric suffix so uniqueness is always guaranteed."""
-    counts: dict[str, int] = {}
-    for n in names:
-        counts[n] = counts.get(n, 0) + 1
-    seen: dict[str, int] = {}
-    result = []
-    for name, hint in zip(names, hints):
-        label = f"{name} — {hint}" if counts[name] > 1 and hint else name
-        seen[label] = seen.get(label, 0) + 1
-        if seen[label] > 1:
-            label = f"{label} ({seen[label]})"
-        result.append(label)
-    return result
-
-
-def update_top_chart(df: pd.DataFrame) -> None:
-    risk = df[df["Status"].isin(["Тасарсан", "ROP-оос доош"])].copy()
-    risk = risk.sort_values(["WeightedGap", "PriorityScore"], ascending=False).head(20)
+def update_top_chart(f: Filters) -> None:
+    risk = db.top_shortages(f)
     names = [str(x)[:55] for x in risk["SKU_Name"]]
-    branches = risk["BranchName"].astype(str).tolist() if "BranchName" in risk.columns else [""] * len(risk)
-    labels = _unique_bar_labels(names, branches)
+    branches = risk["BranchName"].fillna("").astype(str).tolist()
+    labels = MetricsCalculator.unique_bar_labels(names, branches)
     top_source.data = {
         "Name": names,
         "Label": labels,
@@ -476,30 +498,15 @@ def update_top_chart(df: pd.DataFrame) -> None:
     shortage_plot.y_range.factors = labels[::-1]
 
 
-def update_scatter(df: pd.DataFrame) -> None:
-    plot_df = df[df["ROP"].fillna(0) > 0].copy()
+def update_scatter(f: Filters) -> None:
+    # Density layer: every plotted SKU binned into hexagons.
+    density = db.density_points(f)
+    q, r, counts = MetricsCalculator.hexbin_log(density["ROP"], density["InventoryPosition"], HEX_SIZE)
+    hex_source.data = {"q": q, "r": r, "counts": counts}
+    hex_color_mapper.high = max(int(max(counts)) if counts else 1, 1)
 
-    # Density layer: bin every plotted SKU into hexagons. hexbin() is cheap
-    # even at 50k+ rows, so there's no need to sample the population down.
-    if len(plot_df):
-        log_rop = np.log10(plot_df["ROP"].fillna(0).clip(lower=0) + 1).to_numpy()
-        log_inv = np.log10(plot_df["InventoryPosition"].fillna(0).clip(lower=0) + 1).to_numpy()
-        bins = hexbin(log_rop, log_inv, size=HEX_SIZE)
-        # Bokeh >=3.9 returns a dataclass (bins.q); older versions return a
-        # DataFrame (bins["q"]) — support both.
-        q, r, counts = (bins.q, bins.r, bins.counts) if hasattr(bins, "q") else (bins["q"], bins["r"], bins["counts"])
-        hex_source.data = {"q": list(q), "r": list(r), "counts": list(counts)}
-        hex_color_mapper.high = max(int(np.max(counts)), 1)
-    else:
-        hex_source.data = {"q": [], "r": [], "counts": []}
-        hex_color_mapper.high = 1
-
-    # Point layer: only stocked-out / below-ROP SKUs are drawn individually,
-    # since those are the ones a planner actually needs to click into. Cap
-    # as a safety net in the (unusual) case almost everything is critical.
-    risk = plot_df[plot_df["Status"].isin(["Тасарсан", "ROP-оос доош"])].copy()
-    if len(risk) > 3000:
-        risk = risk.nlargest(3000, "PriorityScore")
+    # Point layer: only stocked-out / below-ROP SKUs, capped at 3000 by priority.
+    risk = db.risk_points(f)
     inv = risk["InventoryPosition"].fillna(0).clip(lower=0)
     rop = risk["ROP"].fillna(0).clip(lower=0)
     scatter_source.data = {
@@ -516,64 +523,19 @@ def update_scatter(df: pd.DataFrame) -> None:
 
 
 def update_branch_chart() -> None:
-    br = fact_branch_rop.copy()
-    group = br.groupby("BranchName", as_index=False).agg(
-        ROP=("ROP", "sum"),
-        VROP=("ROP", lambda x: float(x[br.loc[x.index, "VED"] == "V"].sum())),
-        EROP=("ROP", lambda x: float(x[br.loc[x.index, "VED"] == "E"].sum())),
-        DROP=("ROP", lambda x: float(x[br.loc[x.index, "VED"] == "D"].sum())),
-    )
-    group = group.sort_values("ROP", ascending=False).head(30)
-    labels = group["BranchName"].astype(str).tolist()
-    branch_source.data = {
-        "Branch": labels,
-        "ROP": group["ROP"].tolist(),
-        "VROP": group["VROP"].tolist(),
-        "EROP": group["EROP"].tolist(),
-        "DROP": group["DROP"].tolist(),
-        "Color": ["#1F4E5F"] * len(group),
-    }
+    group = db.branch_exposure()
+    labels = group["Branch"].astype(str).tolist()
+    branch_source.data = {col: group[col].tolist() for col in ["Branch", "ROP", "VROP", "EROP", "DROP"]}
     branch_plot.y_range.factors = labels[::-1]
 
 
-def update_coverage(df: pd.DataFrame) -> None:
-    if df.empty:
+def update_coverage(f: Filters) -> None:
+    grouped = MetricsCalculator.finalize_coverage(db.coverage(f))
+    if grouped.empty:
         coverage_source.data = {key: [] for key in coverage_source.data}
         coverage_plot.x_range.factors = []
         coverage_plot.y_range.factors = []
         return
-
-    work = df.copy()
-    work["BranchName"] = work["BranchName"].fillna("Тодорхойгүй").astype(str)
-    work["Category"] = work["Category"].map(clean_category)
-    work["ROP"] = pd.to_numeric(work["ROP"], errors="coerce").fillna(0)
-    work["InventoryPosition"] = pd.to_numeric(work["InventoryPosition"], errors="coerce").fillna(0)
-    work["HasInventory"] = work.get("HasInventory", pd.Series(True, index=work.index)).fillna(False).astype(bool)
-    eligible = work["ROP"] > 0
-    coverage_ratio = np.where(
-        eligible & work["HasInventory"],
-        (work["InventoryPosition"] / work["ROP"]).clip(lower=0, upper=1),
-        0,
-    )
-    covered = eligible & work["HasInventory"] & (coverage_ratio >= 1)
-    work["_Eligible"] = eligible
-    work["_Covered"] = covered
-    work["_CoverageRatio"] = coverage_ratio
-    grouped = work.groupby(["BranchName", "Category"], as_index=False).agg(
-        SKUCount=("SKU_ID", "nunique"),
-        CoveredSKU=("_Covered", "sum"),
-        EligibleSKU=("_Eligible", "sum"),
-        CoverageRatio=("_CoverageRatio", "sum"),
-        ROP=("ROP", "sum"),
-        Inventory=("InventoryPosition", "sum"),
-    )
-    grouped["Coverage"] = np.where(
-        grouped["EligibleSKU"] > 0,
-        grouped["CoverageRatio"] / grouped["EligibleSKU"],
-        np.nan,
-    )
-    grouped["Gap"] = (grouped["ROP"] - grouped["Inventory"]).clip(lower=0)
-    grouped = grouped.sort_values(["BranchName", "Category"])
     coverage_source.data = {
         "Branch": grouped["BranchName"].tolist(),
         "Category": grouped["Category"].tolist(),
@@ -584,25 +546,24 @@ def update_coverage(df: pd.DataFrame) -> None:
         "Inventory": grouped["Inventory"].tolist(),
         "Gap": grouped["Gap"].tolist(),
     }
-    categories = sorted(grouped["Category"].unique().tolist())
-    branches = grouped.groupby("BranchName")["ROP"].sum().sort_values(ascending=True).index.tolist()
-    coverage_mapper.low = 0
-    coverage_mapper.high = 1
-    coverage_plot.x_range.factors = categories
-    coverage_plot.y_range.factors = branches
+    order = db.filter_options()["categories"]
+    present = set(grouped["Category"])
+    coverage_plot.x_range.factors = [c for c in order if c in present] + sorted(present - set(order))
+    coverage_plot.y_range.factors = grouped.groupby("BranchName")["ROP"].sum().sort_values(ascending=True).index.tolist()
 
 
 def update_quality() -> None:
-    st = state["status"]
     inv = state["inventory"]
     mapping = state.get("mapping_stats", {})
+    qm = db.quality()
+    negative = int((pd.to_numeric(inv["OnHand"], errors="coerce") < 0).sum()) if len(inv) and "OnHand" in inv else 0
     metrics = [
         ("Matched rows", mapping.get("matched_rows", 0), f"{mapping.get('mapping_rate_rows', 0):.1%}", "#0F766E"),
         ("Unmatched rows", mapping.get("unmatched_rows", 0), f"{mapping.get('unmatched_rows', 0):,.0f}", "#F97316"),
-        ("Missing inventory SKU", int((~st["HasInventory"].fillna(False)).sum()) if "HasInventory" in st else 0, "SKU", "#7C3AED"),
-        ("Missing ROP SKU", int((~dim_sku["HasROP"].astype(bool)).sum()), "SKU", "#6B7280"),
-        ("Low-confidence ROP", int((dim_sku["ROP_Confidence"] == "Бага").sum()), "SKU", "#F59E0B"),
-        ("Negative inventory", int((pd.to_numeric(inv.get("OnHand", 0), errors="coerce") < 0).sum()) if len(inv) else 0, "rows", "#B91C1C"),
+        ("Missing inventory SKU", qm["missing_inventory"], "SKU", "#7C3AED"),
+        ("Missing ROP SKU", qm["missing_rop_sku"], "SKU", "#6B7280"),
+        ("Low-confidence ROP", qm["low_confidence_sku"], "SKU", "#F59E0B"),
+        ("Negative inventory", negative, "rows", "#B91C1C"),
     ]
     quality_source.data = {
         "Metric": [m[0] for m in metrics],
@@ -613,16 +574,8 @@ def update_quality() -> None:
     quality_plot.x_range.factors = [m[0] for m in metrics]
 
 
-def update_table(df: pd.DataFrame) -> None:
-    cols = [
-        "SKU_ID", "SKU_Name", "BranchName", "VED", "Category", "Status", "InventoryPosition", "ROP", "ROPGap",
-        "CoverageRatio", "ROP_Confidence", "Supplier",
-    ]
-    table_df = df.sort_values(["PriorityScore", "WeightedGap"], ascending=False).head(1000).copy()
-    for col in cols:
-        if col not in table_df:
-            table_df[col] = np.nan
-    table_source.data = ColumnDataSource.from_df(table_df[cols])
+def update_table(f: Filters) -> None:
+    table_source.data = ColumnDataSource.from_df(db.table(f))
 
 
 def update_review_table() -> None:
@@ -634,42 +587,133 @@ def update_review_table() -> None:
     review_source.data = ColumnDataSource.from_df(review[cols].head(2000))
 
 
+def _date_label(date_key: int, scope: str) -> str:
+    label = pd.Timestamp(str(date_key)).strftime("%Y-%m-%d")
+    return f"{label} (сүлжээ)" if scope == "NETWORK" else label
+
+
+def update_movement_options() -> None:
+    dates = db.snapshot_dates()
+    opts = [(str(k), _date_label(k, s)) for k, s in zip(dates["DateKey"], dates["Scope"])]
+    branch_opts = [o for o, s in zip(opts, dates["Scope"]) if s == "BRANCH"] or opts
+    movement_from.options = opts
+    movement_to.options = opts
+    keys = [o[0] for o in branch_opts]
+    if movement_to.value not in {o[0] for o in opts}:
+        movement_to.value = keys[-1] if keys else ""
+    if movement_from.value not in {o[0] for o in opts}:
+        movement_from.value = keys[-2] if len(keys) > 1 else (keys[0] if keys else "")
+
+
+def update_trend(f: Filters) -> None:
+    wide = MetricsCalculator.trend_table(db.trend(f, bool(trend_include_network.active)))
+    labels = [_date_label(k, s) for k, s in zip(wide["DateKey"], wide["Scope"])]
+    total = wide["Total"].where(wide["Total"] > 0)
+    data = {
+        "DateLabel": labels,
+        "Risk": wide[list(RISK_STATUSES)].sum(axis=1).tolist() if len(wide) else [],
+        "Critical": wide["Critical"].tolist(),
+        "Gap": wide["Gap"].tolist(),
+        "Total": wide["Total"].tolist(),
+    }
+    for s in STATUS_ORDER:
+        data[s] = (wide[s] / total).fillna(0).tolist() if len(wide) else []
+    trend_mix_plot.x_range.factors = labels
+    trend_source.data = data
+
+    if len(wide) >= 2:
+        last, prev = wide.iloc[-1], wide.iloc[-2]
+        risk_now, risk_prev = last[list(RISK_STATUSES)].sum(), prev[list(RISK_STATUSES)].sum()
+        html = '<div style="display:flex;gap:12px;flex-wrap:wrap;width:100%;box-sizing:border-box;font-family:Segoe UI,Arial,sans-serif;">'
+        html += card("Эрсдэлтэй SKU × салбар", f"{risk_now:,.0f}", f"Өмнөх snapshot-оос {MetricsCalculator.delta(risk_now, risk_prev)}", STATUS_COLORS["ROP-оос доош"])
+        html += card("Critical V/E", f"{last['Critical']:,.0f}", f"Өмнөх snapshot-оос {MetricsCalculator.delta(last['Critical'], prev['Critical'])}", VED_COLORS["V"])
+        html += card("ROP gap", f"{last['Gap']:,.0f}", f"Өмнөх snapshot-оос {MetricsCalculator.delta(last['Gap'], prev['Gap'])}", "#F97316")
+        html += card("Эрсдэлийн хувь", f"{last['RiskShare']:.1%}", f"Өмнө {prev['RiskShare']:.1%}", "#1F4E5F")
+        html += "</div>"
+        trend_summary.text = html
+    else:
+        trend_summary.text = "<i>Тренд харуулахад дор хаяж 2 snapshot хэрэгтэй.</i>"
+    update_movement(f)
+
+
+def update_movement(f: Filters) -> None:
+    if not movement_from.value or not movement_to.value or movement_from.value == movement_to.value:
+        movement_source.data = ColumnDataSource.from_df(pd.DataFrame(columns=[c.field for c in movement_columns]))
+        movement_summary_div.text = "<i>Хоёр өөр огноо сонгоно уу.</i>"
+        return
+    a, b = int(movement_from.value), int(movement_to.value)
+    summary = db.movement_summary(f, a, b)
+    movement_source.data = ColumnDataSource.from_df(db.movement(f, a, b))
+    if summary["compared"] == 0:
+        movement_summary_div.text = "<i>Хоёр snapshot-д давхцах SKU × салбар мөр алга (сүлжээ ба салбарын scope холилдсон байж магадгүй).</i>"
+        return
+    movement_summary_div.text = (
+        "<div style='font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#374151;padding:6px 0;'>"
+        f"<b>{summary['compared']:,}</b> мөрийг харьцуулснаас "
+        f"<b style='color:#B91C1C;'>{summary['worse']:,} муудсан</b>, "
+        f"<b style='color:#0F766E;'>{summary['better']:,} сайжирсан</b>, "
+        f"нийт {summary['changed']:,} мөрийн status өөрчлөгдсөн. Хүснэгтэд эхний 2,000 мөр (муудсанаас эхлэн)."
+        "</div>"
+    )
+
+
 def refresh_all() -> None:
-    df = filtered_status()
-    update_kpis(df)
-    update_status_chart(df)
-    update_ved_chart(df)
-    update_top_chart(df)
-    update_scatter(df)
-    update_table(df)
-    update_coverage(df)
+    f = current_filters()
+    update_kpis(f)
+    update_status_chart(f)
+    update_ved_chart(f)
+    update_top_chart(f)
+    update_scatter(f)
+    update_table(f)
+    update_coverage(f)
     update_quality()
     update_review_table()
     update_freshness()
+    update_trend(f)
+
+
+def reset_branch_filter() -> None:
+    branch_filter.options = ["ALL"] + db.filter_options()["branches"]
+    branch_filter.value = "ALL"
+    min_gap_slider.end = max(1000, db.max_gap())
 
 
 def rebuild_from_inventory(inv_df: pd.DataFrame, source_file: str, mapping_review: pd.DataFrame | None = None, mapping_stats: dict | None = None) -> None:
+    global dim_branch
     date_value = snapshot_picker.value or metadata.get("snapshot_date", date.today().isoformat())
-    status = build_status_snapshot(dim_sku, inv_df, fact_branch_rop, date_value, excess_slider.value)
+    rop_wide = branch_rop_wide(fact_branch_rop, dim_branch, dim_sku)
+    status = build_status_snapshot(dim_sku, inv_df, rop_wide, date_value, excess_slider.value)
     if missing_as_zero.active:
-        missing_mask = ~status["HasInventory"]
-        status.loc[missing_mask, ["OnHand", "OnOrder", "Backorder", "InventoryPosition"]] = 0.0
-        status.loc[missing_mask, "ROPGap"] = status.loc[missing_mask, "ROP"].clip(lower=0)
-        status.loc[missing_mask, "CoverageRatio"] = np.where(status.loc[missing_mask, "ROP"] > 0, 0.0, np.nan)
-        status.loc[missing_mask & (status["ROP"] > 0), "Status"] = "Тасарсан"
-        status.loc[missing_mask & (status["ROP"] <= 0), "Status"] = "ROP байхгүй"
-        status.loc[missing_mask, "HasInventory"] = True
-        status.loc[missing_mask, "DataMatch"] = "Missing treated as zero"
+        status = apply_missing_as_zero(status)
+    new_dim_branch = ensure_branches(dim_branch, status)
+    if len(new_dim_branch) != len(dim_branch):
+        dim_branch = new_dim_branch
+        db.replace_table("dim_branch", dim_branch)
+    db.replace_table("fact_sku_status", to_fact_status(status))
     state["inventory"] = inv_df
-    state["status"] = status
+    state["status_wide"] = status
     state["mapping_review"] = mapping_review if mapping_review is not None else pd.DataFrame()
     state["mapping_stats"] = mapping_stats or {}
-    state["scope"] = str(status["Scope"].iloc[0]) if len(status) else "NETWORK"
     state["source_file"] = source_file
-    branch_filter.options = ["ALL"] + sorted(status["BranchName"].dropna().astype(str).unique().tolist())
-    branch_filter.value = "ALL"
-    min_gap_slider.end = max(1000, float(status["ROPGap"].max(skipna=True) or 0))
+    reset_branch_filter()
     refresh_all()
+
+
+def save_upload_to_history(snapshot_date: str) -> None:
+    """Persist the uploaded snapshot so it shows up in the Trend tab (now and after restart)."""
+    fact = db.table_frame("fact_sku_status")
+    history = upsert_history(db.table_frame("fact_status_history"), fact)
+    date_keys = sorted(set(history["DateKey"].astype(int)))
+    dim_date = build_dim_date(date_keys)
+    write_tables({"fact_status_history": history, "dim_branch": dim_branch, "dim_date": dim_date})
+    db.replace_table("dim_date", dim_date)
+    db.replace_table("fact_status_history", history)
+    update_movement_options()
+    new_key = str(pd.Timestamp(snapshot_date).strftime("%Y%m%d"))
+    earlier = [key for key, _ in movement_to.options if key < new_key]
+    movement_to.value = new_key
+    if earlier:
+        movement_from.value = earlier[-1]
 
 
 def friendly_error(exc: Exception) -> str:
@@ -696,24 +740,22 @@ def upload_callback(attr: str, old: str, new: str) -> None:
         inventory["SourceFile"] = upload.filename
         mapped, review, stats = map_inventory(inventory, alias_mapping, dim_sku, dim_branch)
         rebuild_from_inventory(mapped, upload.filename, review, stats)
-        stamp = str(snapshot_picker.value).replace("-", "")
-        mapped.to_csv(SNAPSHOT_DIR / f"inventory_{stamp}.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
-        state["status"].to_csv(SNAPSHOT_DIR / f"status_{stamp}.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
-        review.to_csv(SNAPSHOT_DIR / f"mapping_review_{stamp}.csv", index=False, encoding="utf-8-sig")
+        save_snapshot_files(mapped, state["status_wide"], review, snapshot_picker.value)
+        save_upload_to_history(str(snapshot_picker.value))
+        update_trend(current_filters())
         message.text = f"<span style='color:#0F766E;font-weight:700;'>Амжилттай:</span> {upload.filename} | {stats['matched_rows']:,}/{stats['inventory_rows']:,} мөр таарсан ({stats['mapping_rate_rows']:.1%}) | Scope: {stats['scope']}"
     except Exception as exc:
         message.text = f"<span style='color:#B91C1C;font-weight:700;'>Алдаа:</span> {friendly_error(exc)}"
 
 
 def reset_callback() -> None:
-    state["inventory"] = current_inventory.copy()
-    state["status"] = current_status.copy()
-    state["mapping_review"] = current_mapping_review.copy()
-    state["scope"] = "NETWORK"
+    db.replace_table("fact_sku_status", initial_status)
+    state["inventory"] = initial_inventory
+    state["status_wide"] = None
+    state["mapping_review"] = initial_mapping_review.copy()
     state["source_file"] = metadata.get("source_files", {}).get("inventory", "Initial snapshot")
     state["mapping_stats"] = metadata.get("mapping", {})
-    branch_filter.options = ["ALL"] + sorted(current_status["BranchName"].dropna().astype(str).unique().tolist())
-    branch_filter.value = "ALL"
+    reset_branch_filter()
     message.text = "Эхний snapshot сэргээгдлээ."
     refresh_all()
 
@@ -772,13 +814,14 @@ def table_selected_callback(attr: str, old, new) -> None:
     conf = d.get("ROP_Confidence", [""])[idx]
     supplier = d.get("Supplier", [""])[idx]
 
-    master = dim_sku[dim_sku["SKU_ID"] == sku_id] if sku_id is not None and not pd.isna(sku_id) else dim_sku.iloc[0:0]
-    lead = master["LeadTime_Months"].iloc[0] if len(master) and "LeadTime_Months" in master else None
-    demand = master["AvgMonthlyDemand"].iloc[0] if len(master) and "AvgMonthlyDemand" in master else None
-    rop_src = master["ROP_Source"].iloc[0] if len(master) and "ROP_Source" in master else None
+    master = db.sku_detail(int(sku_id)) if sku_id is not None and not pd.isna(sku_id) else {}
+    lead = master.get("LeadTime_Months")
+    demand = master.get("AvgMonthlyDemand")
+    rop_src = master.get("ROP_Source")
 
     sc = STATUS_COLORS.get(status, "#6B7280")
     cov_str = f"{cov:.1%}" if cov is not None and not pd.isna(cov) else "—"
+    supplier_str = supplier if supplier is not None and not pd.isna(supplier) and supplier != "" else "—"
     html = (
         '<div style="font-family:Segoe UI,Arial,sans-serif;background:white;border:1px solid #E5E7EB;'
         f'border-left:5px solid {sc};border-radius:10px;padding:16px 18px;margin:8px 0;">'
@@ -797,7 +840,7 @@ def table_selected_callback(attr: str, old, new) -> None:
         f'{_detail_card("Сарын эрэлт", _fmt(demand))}'
         f'{_detail_card("Lead time (сар)", _fmt(lead))}'
         '</div>'
-        f'<div style="font-size:12px;color:#6B7280;margin-top:10px;">Нийлүүлэгч: {supplier or "—"} · ROP source: {rop_src or "—"} · Confidence: {conf or "—"}</div>'
+        f'<div style="font-size:12px;color:#6B7280;margin-top:10px;">Нийлүүлэгч: {supplier_str} · ROP source: {rop_src or "—"} · Confidence: {conf or "—"}</div>'
         '</div>'
     )
     detail_panel.text = html
@@ -813,27 +856,28 @@ def accept_mapping_callback() -> None:
     key = d.get("NormalizedKey", [""])[idx]
     sku_id = d.get("Suggested_SKU_ID", [None])[idx]
     sku_name = d.get("Suggested_SKU_Name", [""])[idx]
-    if sku_id is None or pd.isna(sku_id):
+    if sku_id is None or pd.isna(sku_id) or str(sku_id) in {"", "<NA>", "nan"}:
         review_message.text = "<span style='color:#B91C1C;'>Энэ мөрөнд санал болгосон SKU байхгүй.</span>"
         return
     global alias_mapping
     new_row = pd.DataFrame([{
         "NormalizedKey": str(key),
-        "SKU_ID": int(sku_id),
+        "SKU_ID": int(float(sku_id)),
         "MasterName": str(sku_name),
         "MappingType": "Manual - dashboard review",
         "Notes": "Accepted in dashboard",
     }])
-    alias_mapping = pd.concat([alias_mapping, new_row], ignore_index=True)
+    # One alias per normalized key: a new decision replaces an older one.
+    updated = pd.concat([alias_mapping[alias_mapping["NormalizedKey"] != str(key)], new_row], ignore_index=True)
     try:
-        alias_mapping.to_csv(DATA_DIR / "alias_mapping.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
-        alias_mapping.to_csv(BASE_DIR / "powerbi_data" / "alias_mapping.csv", index=False, encoding="utf-8-sig")
+        write_tables({"alias_mapping": updated}, refresh_db=False)
     except Exception as exc:
         review_message.text = f"<span style='color:#B91C1C;'>Хадгалахад алдаа: {exc}</span>"
         return
+    alias_mapping = updated
     review_source.patch({"Decision": [(idx, "Зөвшөөрсөн")]})
     review_source.selected.indices = []
-    review_message.text = f"<span style='color:#0F766E;font-weight:700;'>Зөвшөөрөв:</span> '{str(key)[:40]}' → SKU {int(sku_id)} alias-д нэмэгдлээ."
+    review_message.text = f"<span style='color:#0F766E;font-weight:700;'>Зөвшөөрөв:</span> '{str(key)[:40]}' → SKU {int(float(sku_id))} alias-д нэмэгдлээ."
 
 
 def reject_mapping_callback() -> None:
@@ -856,6 +900,14 @@ def filter_callback(attr: str, old, new) -> None:
     refresh_all()
 
 
+def trend_callback(attr: str, old, new) -> None:
+    update_trend(current_filters())
+
+
+def movement_callback(attr: str, old, new) -> None:
+    update_movement(current_filters())
+
+
 upload.on_change("value", upload_callback)
 reset_button.on_click(reset_callback)
 clear_filters_button.on_click(clear_filters_callback)
@@ -865,31 +917,36 @@ excess_slider.on_change("value", threshold_callback)
 missing_as_zero.on_change("active", threshold_callback)
 critical_only.on_change("active", filter_callback)
 table_source.selected.on_change("indices", table_selected_callback)
+trend_include_network.on_change("active", trend_callback)
+movement_from.on_change("value", movement_callback)
+movement_to.on_change("value", movement_callback)
 for widget in [status_filter, ved_filter, category_filter, confidence_filter, branch_filter, search_input, min_gap_slider]:
-    prop = "value"
-    widget.on_change(prop, filter_callback)
+    widget.on_change("value", filter_callback)
 
 # Browser-side CSV export from the currently filtered table source.
-download_button = Button(label="Шүүсэн хүснэгт CSV", button_type="success", width=180)
-download_button.js_on_click(CustomJS(args=dict(source=table_source), code="""
+CSV_EXPORT_JS = """
 const data = source.data;
 const columns = Object.keys(data).filter(k => k !== 'index');
-let csv = columns.join(',') + '\n';
+let csv = columns.join(',') + '\\n';
 const n = data[columns[0]] ? data[columns[0]].length : 0;
 for (let i = 0; i < n; i++) {
   const row = columns.map(c => {
     const value = data[c][i] == null ? '' : String(data[c][i]);
     return '"' + value.replaceAll('"', '""') + '"';
   });
-  csv += row.join(',') + '\n';
+  csv += row.join(',') + '\\n';
 }
-const blob = new Blob(['\ufeff' + csv], {type: 'text/csv;charset=utf-8;'});
+const blob = new Blob(['\\ufeff' + csv], {type: 'text/csv;charset=utf-8;'});
 const link = document.createElement('a');
 link.href = URL.createObjectURL(blob);
-link.download = 'rop_filtered.csv';
+link.download = filename;
 link.click();
 URL.revokeObjectURL(link.href);
-"""))
+"""
+download_button = Button(label="Шүүсэн хүснэгт CSV", button_type="success", width=180)
+download_button.js_on_click(CustomJS(args=dict(source=table_source, filename="rop_filtered.csv"), code=CSV_EXPORT_JS))
+movement_download = Button(label="Өөрчлөлтийн хүснэгт CSV", button_type="success", width=200)
+movement_download.js_on_click(CustomJS(args=dict(source=movement_source, filename="rop_status_movement.csv"), code=CSV_EXPORT_JS))
 
 controls = column(
     Div(text="<b>Шинэ үлдэгдэл оруулах</b><br><span style='font-size:11px;color:#6B7280;'>XLSX / XLSB / CSV; сүлжээний болон салбарын формат танина.</span>"),
@@ -936,6 +993,27 @@ coverage_panel = TabPanel(
         sizing_mode="stretch_width",
     ),
 )
+trend_panel = TabPanel(
+    title="Тренд",
+    child=column(
+        Div(text=(
+            "<div style='padding:10px 0;color:#374151;'>"
+            "<b>Тренд</b> нь хадгалсан snapshot бүрийн status-ийг огноогоор харьцуулна. "
+            "Дээрх шүүлтүүрүүд (категори, VED, салбар, хайлт) энд мөн үйлчилнэ. "
+            "Легенд дээр дарж status-ийг нууж/харуулна."
+            "</div>"
+        ), sizing_mode="stretch_width"),
+        trend_include_network,
+        trend_summary,
+        trend_mix_plot,
+        trend_risk_plot,
+        Div(text="<div style='margin:6px 0 2px 0;padding-top:14px;border-top:1px solid #E5E7EB;font-size:15px;font-weight:700;color:#12263A;'>Status-ийн өөрчлөлт: хоёр snapshot-ийн харьцуулалт</div>", sizing_mode="stretch_width"),
+        row(movement_from, movement_to, movement_download),
+        movement_summary_div,
+        movement_table,
+        sizing_mode="stretch_width",
+    ),
+)
 quality_panel = TabPanel(
     title="Өгөгдлийн чанар",
     child=column(
@@ -947,9 +1025,10 @@ quality_panel = TabPanel(
     ),
 )
 method_panel = TabPanel(title="Аргачлал", child=methodology)
-tabs = Tabs(tabs=[executive_panel, analytics_panel, branch_panel, coverage_panel, quality_panel, method_panel], sizing_mode="stretch_width")
+tabs = Tabs(tabs=[executive_panel, analytics_panel, branch_panel, coverage_panel, trend_panel, quality_panel, method_panel], sizing_mode="stretch_width")
 
 update_branch_chart()
+update_movement_options()
 refresh_all()
 
 curdoc().add_root(column(header, freshness_banner, controls, filters, tabs, sizing_mode="stretch_width"))

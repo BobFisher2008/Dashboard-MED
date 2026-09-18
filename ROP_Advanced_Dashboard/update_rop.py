@@ -1,60 +1,46 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
 import pandas as pd
 
-from common import (
-    branch_group,
-    build_status_snapshot,
-    clean_category,
-    is_excluded_branch,
-    load_project_data,
-    save_json,
-)
+from common import build_status_snapshot, excluded_mask, load_project_data, save_json
+from warehouse import DATA_DIR, branch_rop_wide, ensure_branches, status_tables, to_fact_branch_rop, write_tables
 
 BASE = Path(__file__).resolve().parent
-DATA_DIR = BASE / "data"
-PBI_DIR = BASE / "powerbi_data"
 ROP_FILE = BASE / "ROP final.xlsb"
 
 
-def write_csv(frame: pd.DataFrame, name: str) -> None:
-    frame.to_csv(DATA_DIR / f"{name}.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
-    frame.to_csv(PBI_DIR / f"{name}.csv", index=False, encoding="utf-8-sig")
-
-
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Load the final branch ROP workbook into the warehouse.")
+    parser.add_argument("--rop", type=Path, default=ROP_FILE)
+    parser.add_argument("--powerbi", action="store_true", help="Also export readable CSVs to powerbi_data/")
+    args = parser.parse_args()
+
     frames = load_project_data(DATA_DIR)
     dim_sku = frames["dim_sku"].copy()
-    dim_sku["Category"] = dim_sku["Category"].map(clean_category)
     dim_branch = frames["dim_branch"].copy()
     fact_inventory = frames["fact_inventory_snapshot"].copy()
     metadata = json.loads((DATA_DIR / "metadata.json").read_text(encoding="utf-8"))
 
     # 1. Read the final ROP detail (one row per SKU x branch).
-    detail = pd.read_excel(ROP_FILE, sheet_name="Нэгтгэл", engine="pyxlsb")
+    detail = pd.read_excel(args.rop, sheet_name="Нэгтгэл", engine="pyxlsb")
     detail["SKU_ID"] = pd.to_numeric(detail["SKU ID"], errors="coerce").astype("Int64")
     detail = detail[detail["SKU_ID"].notna()].copy()
     detail["SKU_ID"] = detail["SKU_ID"].astype(int)
-    detail = detail.loc[~detail["Салбар"].map(is_excluded_branch)].copy()
+    detail = detail.loc[~excluded_mask(detail["Салбар"])].copy()
 
-    # 2. Rebuild dim_branch, preserving existing Branch_IDs and adding new ones.
+    # 2. Keep every existing Branch_ID (history refers to them) and add new ones.
     existing_branch_id = dict(zip(dim_branch["BranchName"].astype(str), dim_branch["Branch_ID"].astype(str)))
-    branches = sorted(detail["Салбар"].dropna().astype(str).unique())
-    next_id = max(int(x[1:]) for x in existing_branch_id.values() if x.startswith("B")) + 1
-    for b in branches:
+    next_id = max(int(x[1:]) for x in existing_branch_id.values() if x[:1] == "B" and x[1:].isdigit()) + 1
+    for b in sorted(detail["Салбар"].dropna().astype(str).unique()):
         if b not in existing_branch_id:
             existing_branch_id[b] = f"B{next_id:03d}"
             next_id += 1
-
-    new_dim_branch = pd.DataFrame({"BranchName": ["NETWORK"] + branches})
-    new_dim_branch["Branch_ID"] = new_dim_branch["BranchName"].map(
-        lambda x: "NETWORK" if x == "NETWORK" else existing_branch_id[x]
-    )
-    new_dim_branch["BranchGroup"] = new_dim_branch["BranchName"].map(branch_group)
-    new_dim_branch["IsNetwork"] = new_dim_branch["Branch_ID"].eq("NETWORK")
+    new_branches = pd.DataFrame({"BranchName": list(existing_branch_id), "Branch_ID": list(existing_branch_id.values())})
+    dim_branch = ensure_branches(dim_branch, new_branches)
 
     # 3. Build fact_branch_rop from the final ROP values.
     def num(col: str) -> pd.Series:
@@ -77,13 +63,13 @@ def main() -> None:
         "Z_ABCXYZ": num("Z ABC-XYZ"),
         "Z_Final": num("Z эцсийн"),
         "VED": detail["VED"].fillna("Тодорхойгүй"),
-        "Category": detail["Категори"].map(clean_category),
     })
     fact = fact[fact["Branch_ID"].notna()].reset_index(drop=True)
     fact["HasROP"] = fact["ROP"] > 0
+    fact_branch_rop = to_fact_branch_rop(fact)  # also drops duplicate SKU x branch rows
 
     # 4. Update the network-level ROP in dim_sku (sum of branch ROP per SKU).
-    network_rop = fact.groupby("SKU_ID")["ROP"].sum()
+    network_rop = fact_branch_rop.groupby("SKU_ID")["ROP"].sum()
     dim_sku["ROP_Corrected"] = dim_sku["SKU_ID"].map(network_rop).fillna(0)
     in_new = dim_sku["SKU_ID"].isin(network_rop.index)
     dim_sku.loc[in_new, "ROP_Used"] = dim_sku.loc[in_new, "ROP_Corrected"]
@@ -92,31 +78,32 @@ def main() -> None:
     dim_sku["HasROP"] = dim_sku["ROP_Used"] > 0
     dim_sku["HasDetailROP"] = dim_sku["ROP_Source"].eq("Зассан дэлгэрэнгүй томьёо")
 
-    # 5. Remap inventory Branch_ID to the new dim_branch (no-op for existing branches).
-    if "Branch_ID" in fact_inventory:
-        fact_inventory["Branch_ID"] = (
-            fact_inventory["BranchName"].astype(str).map(existing_branch_id).fillna(fact_inventory["Branch_ID"])
-        )
+    # 5. Remap inventory Branch_ID to the branch dimension (no-op for existing branches).
+    fact_inventory["Branch_ID"] = fact_inventory["BranchName"].astype(str).map(existing_branch_id).fillna(fact_inventory["Branch_ID"])
 
-    # 6. Recompute status with the updated ROP.
+    # 6. Recompute the current status with the updated ROP.
     snapshot_date = metadata.get("snapshot_date", "2026-09-07")
     excess_threshold = float(metadata.get("excess_threshold", 2.0))
-    status = build_status_snapshot(dim_sku, fact_inventory, fact, snapshot_date, excess_threshold)
+    rop_wide = branch_rop_wide(fact_branch_rop, dim_branch, dim_sku)
+    status = build_status_snapshot(dim_sku, fact_inventory, rop_wide, snapshot_date, excess_threshold)
 
     # 7. Write outputs.
-    write_csv(dim_sku, "dim_sku")
-    write_csv(new_dim_branch, "dim_branch")
-    write_csv(fact, "fact_branch_rop")
-    write_csv(status, "fact_sku_status")
+    tables = status_tables(status, dim_branch, fact_inventory)
+    write_tables({
+        **tables,
+        "dim_sku": dim_sku,
+        "fact_branch_rop": fact_branch_rop,
+        "fact_inventory_snapshot": fact_inventory,
+    }, powerbi=args.powerbi)
 
     # 8. Update metadata.
     metadata.update({
-        "source_files": {**metadata.get("source_files", {}), "rop": ROP_FILE.name},
+        "source_files": {**metadata.get("source_files", {}), "rop": Path(args.rop).name},
         "sku_count": int(len(dim_sku)),
-        "branch_count": int((~new_dim_branch["IsNetwork"]).sum()),
-        "branch_rop_rows": int(len(fact)),
+        "branch_count": int((~tables["dim_branch"]["IsNetwork"]).sum()),
+        "branch_rop_rows": int(len(fact_branch_rop)),
         "network_rop_total": float(dim_sku["ROP_Used"].sum()),
-        "corrected_branch_rop_total": float(fact["ROP"].sum()),
+        "corrected_branch_rop_total": float(fact_branch_rop["ROP"].sum()),
         "status_counts": {str(k): int(v) for k, v in status["Status"].value_counts().to_dict().items()},
         "critical_ve_sku": int(status["IsCritical"].sum()),
         "rop_gap_total": float(status["ROPGap"].sum(skipna=True)),
@@ -126,14 +113,12 @@ def main() -> None:
         "low_confidence_rop_sku": int((dim_sku["ROP_Confidence"] == "Бага").sum()),
     })
     save_json(DATA_DIR / "metadata.json", metadata)
-    save_json(PBI_DIR / "metadata.json", metadata)
 
     print(json.dumps({
         "sku_count": int(len(dim_sku)),
-        "branch_count": int((~new_dim_branch["IsNetwork"]).sum()),
-        "branch_rop_rows": int(len(fact)),
+        "branch_rop_rows": int(len(fact_branch_rop)),
         "network_rop_total": float(dim_sku["ROP_Used"].sum()),
-        "corrected_branch_rop_total": float(fact["ROP"].sum()),
+        "corrected_branch_rop_total": float(fact_branch_rop["ROP"].sum()),
         "rop_gap_total": float(status["ROPGap"].sum(skipna=True)),
         "critical_ve_sku": int(status["IsCritical"].sum()),
     }, ensure_ascii=False, indent=2))
