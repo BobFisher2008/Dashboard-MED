@@ -790,7 +790,7 @@ optional hook: --on-success / --on-failure "<command>"  (env: INVENTORY_FILE, SN
 
 ### 2026-09-18 — Repository set up
 - Added `.gitignore`. Committed the original package as a baseline on `master` and the refactor on `star-schema-refactor`.
-- Deleting `README_MN.md` and `powerbi/` (DAX, Power Query, layout docs) is still uncommitted, pending a decision. The Power BI docs describe the old wide CSVs and would need updating if kept.
+- `README_MN.md` and `powerbi/` (DAX, Power Query, layout docs) were deleted on 2026-09-23; they described the old wide CSVs. They remain in the baseline commit's history.
 
 ### 2026-09-18 — Star-schema refactor
 - Added `warehouse.py`, `queries.py`, `metrics.py`, `tests/`; `app.py` is now UI only.
