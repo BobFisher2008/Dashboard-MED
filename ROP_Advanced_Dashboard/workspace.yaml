@@ -1,0 +1,5 @@
+# Lets a plain `dagster dev` in this folder find the pipeline.
+load_from:
+  - python_module:
+      module_name: dagster_rop.definitions
+      working_directory: .

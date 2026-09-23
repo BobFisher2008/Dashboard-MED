@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import date
+import time
+from dataclasses import replace
+from datetime import date, datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -16,38 +19,48 @@ from bokeh.models import (
     CustomJS,
     DataRange1d,
     DataTable,
+    DateFormatter,
     DatePicker,
     Div,
     FactorRange,
     FileInput,
+    GlobalInlineStyleSheet,
     HoverTool,
+    HTMLTemplateFormatter,
+    InlineStyleSheet,
+    Label,
     LinearAxis,
     LinearColorMapper,
     MultiChoice,
     NumberFormatter,
     NumeralTickFormatter,
+    RadioButtonGroup,
+    Range1d,
     Select,
     Slider,
+    Span,
     StringFormatter,
     TableColumn,
     TabPanel,
     Tabs,
     TextInput,
 )
-from bokeh.palettes import Viridis256
+from bokeh.palettes import Blues256, RdYlGn11
 from bokeh.plotting import figure
-from bokeh.transform import cumsum
 
 from common import (
     STATUS_ORDER,
-    VED_ORDER,
+    VED_CLASSES,
     apply_missing_as_zero,
     build_status_snapshot,
+    load_branch_list,
     map_inventory,
+    normalize_product_name,
     parse_inventory,
 )
+from expiry import EXPIRY_STATUS_COLORS, ExpiryConfig, build_batch_expiry, build_dim_expiry_status
 from metrics import MetricsCalculator
-from queries import DashboardQuery, Filters
+from queries import CLASS_ORDER, COVERAGE_BANDS, FUTURE_EXPIRY_STATUSES, TOTAL, DashboardQuery, Filters
 from warehouse import (
     DATA_DIR,
     RISK_STATUSES,
@@ -74,6 +87,32 @@ alias_mapping = db.table_frame("alias_mapping")
 initial_status = db.table_frame("fact_sku_status")
 initial_inventory = db.table_frame("fact_inventory_snapshot")
 initial_mapping_review = db.table_frame("mapping_review")
+initial_batches = db.table_frame("fact_batch_expiry") if "fact_batch_expiry" in db.tables() else None
+initial_expiry_meta = metadata.get("expiry")
+
+# Active branches: «Салбарын жагсаалт.txt», in file order. Every ROP view,
+# filter and chart covers these branches only; without the file, all branches.
+BRANCH_LIST_PATH = Path(__file__).resolve().parent / "Салбарын жагсаалт.txt"
+
+
+def tracked_branches() -> list[tuple[str, str | None]]:
+    """(name as listed, the warehouse's BranchName or None) per listed branch.
+    Names match exactly or by normalized key (spacing, dashes, case)."""
+    if not BRANCH_LIST_PATH.exists():
+        return []
+    known = {normalize_product_name(b): b for b in dim_branch["BranchName"].dropna().astype(str)}
+    return [(name, known.get(normalize_product_name(name))) for name in load_branch_list(BRANCH_LIST_PATH)]
+
+
+TRACKED = tracked_branches()
+TRACKED_NAMES = tuple(dict.fromkeys(data for _, data in TRACKED if data))
+db.set_active_branches(TRACKED_NAMES)
+
+
+def branch_options() -> list[str]:
+    """Branch filter choices: the active branches with data, in list order."""
+    present = set(db.filter_options()["branches"])
+    return [b for b in TRACKED_NAMES if b in present] if TRACKED_NAMES else sorted(present)
 
 STATUS_COLORS = {
     "Тасарсан": "#B91C1C",
@@ -84,7 +123,13 @@ STATUS_COLORS = {
     "Илүүдэл": "#2563EB",
 }
 VED_COLORS = {"V": "#B91C1C", "E": "#F59E0B", "D": "#0F766E", "Тодорхойгүй": "#6B7280"}
-HEX_SIZE = 0.12  # bin width in log10 units for the ROP-vs-inventory density plot
+# VED selection: the three classes only - no «Тодорхойгүй» entry.
+VED_CHOICES = list(VED_CLASSES)
+# Status selection: every status but «Тасарсан» (still counted, shown and in «Зөвхөн эрсдэлтэй»).
+# Statuses on the status grids (bar chart, VED / ABC / XYZ x Status). «ROP байхгүй» is
+# left off: rows without sales are out of ROP reporting, so it is always empty.
+GRID_STATUSES = [s for s in STATUS_ORDER if s != "ROP байхгүй"]
+STATUS_CHOICES = [s for s in GRID_STATUSES if s != "Тасарсан"]
 
 state = {
     "inventory": initial_inventory,
@@ -113,24 +158,29 @@ critical_only = CheckboxGroup(labels=["Зөвхөн эрсдэлтэй (Таса
 message = Div(text="", width=600, height=55)
 
 options = db.filter_options()
-status_filter = MultiChoice(title="Status", value=[], options=STATUS_ORDER, width=260)
-ved_filter = MultiChoice(title="VED", value=[], options=VED_ORDER, width=220)
+status_filter = MultiChoice(title="Status", value=[], options=STATUS_CHOICES, width=260)
+ved_filter = MultiChoice(title="VED", value=[], options=VED_CHOICES, width=220)
 category_filter = MultiChoice(title="Категори", value=[], options=options["categories"], width=260)
-confidence_filter = MultiChoice(title="ROP confidence", value=[], options=options["confidences"], width=200)
-branch_filter = Select(title="Салбар", value="ALL", options=["ALL"] + options["branches"], width=300)
+branch_filter = Select(title="Салбар", value="ALL", options=["ALL"] + branch_options(), width=300)
 search_input = TextInput(title="Барааны нэр хайх", placeholder="жишээ: Тобрекс", width=320)
 min_gap_slider = Slider(title="Доод ROP gap", start=0, end=max(1000, db.max_gap()), value=0, step=1, width=240)
 
 kpi_container = Div(text="", sizing_mode="stretch_width", height=135)
-status_source = ColumnDataSource(data=dict(Status=[], Count=[], Angle=[], Color=[]))
-ved_source = ColumnDataSource(data=dict(VED=[], Critical=[], Gap=[], Color=[]))
-top_source = ColumnDataSource(data=dict(Name=[], Label=[], Branch=[], Gap=[], WeightedGap=[], VED=[], Status=[], OnHand=[], ROP=[], Color=[]))
-scatter_source = ColumnDataSource(data=dict(Name=[], ROPPlot=[], InvPlot=[], ROP=[], Inventory=[], Gap=[], VED=[], Status=[], Color=[]))
-hex_source = ColumnDataSource(data=dict(q=[], r=[], counts=[]))
-branch_source = ColumnDataSource(data=dict(Branch=[], ROP=[], VROP=[], EROP=[], DROP=[]))
-coverage_source = ColumnDataSource(data=dict(
-    Branch=[], Category=[], Coverage=[], SKUCount=[], CoveredSKU=[], ROP=[], Inventory=[], Gap=[],
+status_source = ColumnDataSource(data=dict(Status=[], Count=[], Share=[], Label=[], Color=[], Alpha=[]))
+top_source = ColumnDataSource(data=dict(
+    Label=[], Name=[], Branch=[], VED=[], Status=[], Value=[], ValueText=[], Gap=[], OnHand=[], ROP=[], Color=[],
 ))
+branch_source = ColumnDataSource(data=dict(Branch=[], ROP=[], VROP=[], EROP=[], DROP=[], VShare=[], EShare=[], DShare=[]))
+coverage_source = ColumnDataSource(data=dict(
+    Branch=[], Category=[], Value=[], AvgCoverage=[], CoveredShare=[], FillRate=[], EligibleRows=[], CoveredRows=[],
+    SKUCount=[], ROP=[], Filled=[], Gap=[], Line=[], LineWidth=[],
+))
+coverage_total_text = ColumnDataSource(data=dict(Branch=[], Category=[], Text=[]))
+coverage_bar_source = ColumnDataSource(data=dict(
+    Label=[], Value=[], ValueText=[], AvgCoverage=[], CoveredShare=[], FillRate=[], EligibleRows=[], CoveredRows=[],
+    SKUCount=[], BranchCount=[], ROP=[], Filled=[], Gap=[],
+))
+coverage_table_source = ColumnDataSource(data=dict())
 quality_source = ColumnDataSource(data=dict(Metric=[], Value=[], Label=[], Color=[]))
 table_source = ColumnDataSource(data=dict())
 review_source = ColumnDataSource(data=dict())
@@ -138,144 +188,425 @@ trend_source = ColumnDataSource(data={"DateLabel": [], "Risk": [], "Critical": [
 movement_source = ColumnDataSource(data=dict())
 
 
-def empty_figure(title: str, height: int = 360):
-    p = figure(title=title, height=height, sizing_mode="stretch_width", toolbar_location="above")
+def empty_figure(title: str, height: int = 360, **ranges):
+    """Styled figure; pass categorical x_range / y_range here (not afterwards)
+    so Bokeh picks the matching categorical scale."""
+    p = figure(title=title, height=height, sizing_mode="stretch_width", toolbar_location="above", **ranges)
     p.grid.grid_line_alpha = 0.15
     p.title.text_font_size = "14pt"
     p.title.text_font_style = "bold"
     return p
 
 
-status_plot = empty_figure("Status бүтэц", 370)
-status_plot.annular_wedge(
-    x=0, y=0, inner_radius=0.55, outer_radius=0.95,
-    start_angle=cumsum("Angle", include_zero=True), end_angle=cumsum("Angle"),
-    color="Color", legend_field="Status", source=status_source,
-)
-status_plot.axis.visible = False
-status_plot.grid.grid_line_color = None
-status_plot.legend.location = "center_right"
-status_plot.legend.label_text_font_size = "9pt"
-status_plot.add_tools(HoverTool(tooltips=[("Status", "@Status"), ("SKU", "@Count{0,0}")]))
+DATA_QUALITY_STATUSES = ("Өгөгдөл алга", "ROP байхгүй")
+TOP_MODES = ["auto", "gap", "excess", "stock", "missing"]
+TOP_TITLES = {
+    "gap": ("Нөхөх шаардлагатай TOP 20", "VED-жигнэсэн ROP gap"),
+    "excess": ("ROP-оос илүү нөөцтэй TOP 20", "Үлдэгдэл − ROP (ширхэг)"),
+    "stock": ("Хамгийн их үлдэгдэлтэй TOP 20", "Inventory Position (ширхэг)"),
+    "missing": ("Үлдэгдлийн мэдээлэлгүй — ROP хамгийн өндөр TOP 20", "ROP (ширхэг)"),
+}
 
-ved_plot = figure(
-    title="VED эрсдэл: critical SKU ба ROP gap", height=370, sizing_mode="stretch_width",
-    toolbar_location="above", x_range=FactorRange(*VED_ORDER),
-)
-ved_plot.grid.grid_line_alpha = 0.15
-ved_plot.title.text_font_size = "14pt"
-ved_plot.title.text_font_style = "bold"
-ved_bar_renderer = ved_plot.vbar(x="VED", top="Critical", width=0.55, color="Color", source=ved_source, legend_label="Critical SKU")
-ved_plot.extra_y_ranges = {"gap": DataRange1d()}
-ved_plot.add_layout(LinearAxis(y_range_name="gap", axis_label="ROP gap"), "right")
-ved_gap_renderer = ved_plot.scatter(x="VED", y="Gap", y_range_name="gap", source=ved_source, size=12, marker="diamond", color="#111827", legend_label="ROP gap")
-# Bokeh's DataRange1d auto-scales from every renderer on the plot by
-# default, regardless of which axis they're assigned to -- without scoping
-# each range explicitly, the primary (Critical count, max ~hundreds) axis
-# balloons to match the secondary (ROP gap, max ~tens of thousands) axis,
-# squashing the bars to invisible slivers.
-ved_plot.y_range.renderers = [ved_bar_renderer]
-ved_plot.extra_y_ranges["gap"].renderers = [ved_gap_renderer]
-ved_plot.add_tools(HoverTool(tooltips=[("VED", "@VED"), ("Critical SKU", "@Critical{0,0}"), ("ROP gap", "@Gap{0,0}")]))
-ved_plot.xgrid.grid_line_color = None
-ved_plot.y_range.start = 0
-ved_plot.legend.location = "top_left"
-ved_plot.legend.label_text_font_size = "9pt"
-ved_plot.legend.background_fill_alpha = 0.7
 
+def no_data_label() -> Label:
+    return Label(x=14, y=14, x_units="screen", y_units="screen", visible=False,
+                 text="Сонгосон шүүлтүүрт тохирох мэдээлэл алга", text_font_size="12pt", text_color="#6B7280")
+
+
+# Status mix as labelled bars: a tiny status (e.g. 4 stock-outs next to 120k
+# "no data" rows) is still readable from its label. Click a bar to filter.
+status_plot = empty_figure("Status бүтэц — SKU × салбарын мөр", 370,
+                           y_range=FactorRange(*reversed(GRID_STATUSES)), x_range=Range1d(0, 1))
+status_plot.toolbar_location = None
+status_bars = status_plot.hbar(
+    y="Status", right="Count", height=0.68, source=status_source,
+    fill_color="Color", fill_alpha="Alpha", line_color=None,
+    nonselection_fill_alpha="Alpha", nonselection_fill_color="Color",
+)
+status_plot.text(x="Count", y="Status", text="Label", source=status_source, x_offset=6,
+                 text_baseline="middle", text_font_size="10pt", text_color="#111827")
+status_plot.add_tools(HoverTool(tooltips=[("Status", "@Status"), ("Мөр", "@Count{0,0}"), ("Хувь", "@Share{0.0%}")], renderers=[status_bars]), "tap")
+status_plot.xaxis.formatter = NumeralTickFormatter(format="0,0")
+status_plot.ygrid.grid_line_color = None
+status_plot.yaxis.major_label_text_font_size = "10pt"
+status_empty = no_data_label()
+status_plot.add_layout(status_empty)
+
+def status_heatmap(label: str, classes: list[str]) -> tuple:
+    """<label> x Status heatmap: count and share of the class row in every cell;
+    colour = count relative to the largest cell (stays readable with one status
+    selected). Returns (figure, source, no-data label)."""
+    source = ColumnDataSource(data=dict(Class=[], Status=[], Count=[], Share=[], Intensity=[], Gap=[], Excess=[], Text=[], TextColor=[]))
+    mapper = LinearColorMapper(palette=list(reversed(Blues256))[20:], low=0, high=1)
+    p = empty_figure(f"{label} × Status — SKU × салбарын мөр", 370,
+                     x_range=FactorRange(*GRID_STATUSES), y_range=FactorRange(*reversed(classes)))
+    p.toolbar_location = None
+    cells = p.rect(
+        x="Status", y="Class", width=0.96, height=0.94, source=source, line_color=None,
+        fill_color={"field": "Intensity", "transform": mapper},
+        nonselection_fill_alpha=1.0,
+    )
+    p.text(x="Status", y="Class", text="Text", source=source, text_align="center", text_baseline="middle",
+           text_font_size="10pt", text_color="TextColor")
+    p.add_tools(HoverTool(tooltips=[
+        (label, "@Class"), ("Status", "@Status"), ("Мөр", "@Count{0,0}"), (f"{label} доторх хувь", "@Share{0.0%}"),
+        ("ROP gap", "@Gap{0,0}"), ("ROP-оос илүү нөөц", "@Excess{0,0}"),
+    ], renderers=[cells]), "tap")
+    p.grid.grid_line_color = None
+    p.axis.axis_line_color = None
+    p.axis.major_tick_line_color = None
+    p.xaxis.major_label_text_font_size = "9pt"
+    p.yaxis.major_label_text_font_size = "11pt"
+    empty = no_data_label()
+    p.add_layout(empty)
+    return p, source, empty
+
+
+ved_plot, ved_source, ved_empty = status_heatmap("VED", VED_CHOICES)
+
+# TOP 20: ranking follows the status filter (shortage / stock above ROP / stock).
+top_mode = RadioButtonGroup(labels=["Автомат", "Дутагдал", "Илүүдэл", "Үлдэгдэл", "Мэдээлэлгүй"], active=0, width=460)
+top_level = RadioButtonGroup(labels=["SKU × салбар", "SKU (салбаруудын нийт)"], active=0, width=320)
 shortage_plot = figure(
-    title="Нөхөх шаардлагатай TOP 20 SKU",
-    y_range=[], height=520, sizing_mode="stretch_width", toolbar_location="above",
+    title="Нөхөх шаардлагатай TOP 20", y_range=FactorRange(), x_range=Range1d(0, 1),
+    height=560, sizing_mode="stretch_width", toolbar_location="above",
 )
-shortage_plot.hbar(y="Label", right="WeightedGap", height=0.72, color="Color", source=top_source)
+top_bars = shortage_plot.hbar(y="Label", right="Value", height=0.72, color="Color", legend_field="VED", source=top_source)
+shortage_plot.text(x="Value", y="Label", text="ValueText", source=top_source, x_offset=5,
+                   text_baseline="middle", text_font_size="9pt", text_color="#374151")
 shortage_plot.add_tools(HoverTool(tooltips=[
     ("Нэр", "@Name"), ("Салбар", "@Branch"), ("VED", "@VED"), ("Status", "@Status"),
-    ("On hand", "@OnHand{0,0.00}"), ("ROP", "@ROP{0,0}"), ("Gap", "@Gap{0,0.00}"),
-]))
-shortage_plot.xaxis.axis_label = "VED-weighted ROP gap"
+    ("Үлдэгдэл", "@OnHand{0,0.00}"), ("ROP", "@ROP{0,0}"), ("ROP gap", "@Gap{0,0.00}"), ("Утга", "@Value{0,0.00}"),
+], renderers=[top_bars]))
+shortage_plot.xaxis.axis_label = "VED-жигнэсэн ROP gap"
+shortage_plot.xaxis.formatter = NumeralTickFormatter(format="0,0")
 shortage_plot.grid.grid_line_alpha = 0.15
+shortage_plot.title.text_font_size = "13pt"
+shortage_plot.legend.location = "bottom_right"
+shortage_plot.legend.title = "VED"
+top_empty = no_data_label()
+shortage_plot.add_layout(top_empty)
 
-scatter_plot = figure(
-    title="Inventory Position vs ROP — нягтралын дулааны зураг", height=500,
-    sizing_mode="stretch_width", toolbar_location="above",
-)
-# Density layer: every SKU gets binned into a hexagon instead of drawn as its
-# own dot, so thousands of points read as a heatmap rather than a haze.
-hex_color_mapper = LinearColorMapper(palette=Viridis256, low=0, high=1)
-hex_renderer = scatter_plot.hex_tile(
-    q="q", r="r", size=HEX_SIZE, source=hex_source, line_color=None,
-    fill_color={"field": "counts", "transform": hex_color_mapper},
-)
-scatter_plot.add_tools(HoverTool(tooltips=[("SKU тоо (нүд бүрт)", "@counts")], renderers=[hex_renderer]))
-scatter_plot.add_layout(
-    ColorBar(color_mapper=hex_color_mapper, label_standoff=8, title="SKU тоо", location=(0, 0)),
-    "right",
-)
-# Point layer: only actionable SKUs (stocked-out / below ROP) get an
-# individual, hoverable dot drawn on top of the density.
-critical_renderer = scatter_plot.scatter(
-    x="ROPPlot", y="InvPlot", size=8, alpha=0.9, color="Color",
-    line_color="#111827", line_width=0.5, source=scatter_source,
-    legend_label="Эрсдэлтэй SKU (Тасарсан / ROP-оос доош)",
-)
-scatter_plot.add_tools(HoverTool(tooltips=[
-    ("Нэр", "@Name"), ("VED", "@VED"), ("Status", "@Status"),
-    ("ROP", "@ROP{0,0}"), ("Inventory", "@Inventory{0,0.00}"), ("Gap", "@Gap{0,0.00}"),
-], renderers=[critical_renderer]))
-scatter_plot.line([0, 6], [0, 6], line_dash="dashed", line_color="#4B5563", line_width=1)
-scatter_plot.xaxis.axis_label = "log10(ROP + 1)"
-scatter_plot.yaxis.axis_label = "log10(Inventory Position + 1)"
-scatter_plot.legend.location = "top_left"
-scatter_plot.legend.background_fill_alpha = 0.7
+# --- SKU анализ tab -------------------------------------------------------------
+# One question per chart: how much stock does each SKU x branch hold against
+# its ROP (stock / ROP bands), and are the critical V / E items the short ones?
+# Click a band bar to list its rows in the table below.
+BANDS = {  # key: (axis label, colour, what it means)
+    "OUT": ("Тасарсан", "#991B1B", "Үлдэгдэл 0 — бараа дууссан"),
+    "LOW": ("ROP-ийн 50%-иас бага", "#DC2626", "Үлдэгдэл ROP-ийн талаас бага — яаралтай нөхөх"),
+    "BELOW": ("ROP-ийн 50–99%", "#F59E0B", "ROP-оос бага — удахгүй нөхөх"),
+    "OK": ("ROP-ийн 1–2 дахин", "#16A34A", "Хэвийн нөөц"),
+    "HIGH": ("ROP-ийн 2–3 дахин", "#60A5FA", "ROP-оос илүү нөөц"),
+    "OVER": ("ROP-ийн 3+ дахин", "#1D4ED8", "Хэт их нөөц — мөнгө хөлдсөн"),
+    "NOROP": ("ROP 0", "#6B7280", "Борлуулалттай ч ROP тооцоогүй"),
+    "NODATA": ("Үлдэгдлийн мэдээлэлгүй", "#CBD5E1", "Үлдэгдлийн файлд энэ SKU × салбар алга"),
+}
+SHORT_BANDS = ("OUT", "LOW", "BELOW")
 
-branch_plot = figure(title="Салбарын ROP exposure", y_range=[], height=610, sizing_mode="stretch_width", toolbar_location="above")
+sku_kpis = Div(text="", sizing_mode="stretch_width", height=120)
+sku_band = Select(title="Жагсаалтыг шүүх: үлдэгдэл ÷ ROP", value="", width=320,
+                  options=[("", "Бүх бүлэг")] + [(k, BANDS[k][0]) for k in COVERAGE_BANDS])
+
+band_source = ColumnDataSource(data=dict(Key=[], Label=[], Rows=[], SKUs=[], Share=[], Text=[], Color=[], Alpha=[],
+                                         Desc=[], Gap=[], Excess=[]))
+band_plot = empty_figure("Үлдэгдэл ROP-оо хэр хангаж байна вэ? (SKU × салбарын мөр)", 400, x_range=FactorRange())
+band_plot.toolbar_location = None
+band_bars = band_plot.vbar(
+    x="Label", top="Rows", width=0.74, source=band_source, line_color=None,
+    fill_color="Color", fill_alpha="Alpha", nonselection_fill_alpha="Alpha", nonselection_fill_color="Color",
+)
+band_plot.text(x="Label", y="Rows", text="Text", source=band_source, text_align="center", text_baseline="bottom",
+               y_offset=-4, text_font_size="10pt", text_font_style="bold", text_color="#111827")
+band_plot.add_tools(HoverTool(tooltips=[
+    ("", "@Label"), ("Утга", "@Desc"), ("Мөр", "@Rows{0,0} (@Share{0.0%})"), ("SKU", "@SKUs{0,0}"),
+    ("ROP хүртэл дутуу", "@Gap{0,0}"), ("ROP-оос илүү", "@Excess{0,0}"),
+], renderers=[band_bars]), "tap")
+band_plot.y_range = Range1d(0, 1)
+band_plot.yaxis.formatter = NumeralTickFormatter(format="0,0")
+band_plot.yaxis.axis_label = "SKU × салбарын мөр"
+band_plot.xaxis.major_label_text_font_size = "10pt"
+band_plot.xaxis.major_label_orientation = 0.35
+band_plot.xgrid.grid_line_color = None
+band_empty = no_data_label()
+band_plot.add_layout(band_empty)
+
+# VED x band as 100% stacked bars: one glance shows whether the critical V
+# items are covered as well as the D items.
+ved_band_source = ColumnDataSource(data={"VED": [], **{k: [] for k in COVERAGE_BANDS}, **{f"{k}_n": [] for k in COVERAGE_BANDS}})
+ved_band_plot = empty_figure("VED ангиллаар — мөрийн бүтэц (%)", 400, y_range=FactorRange(*reversed(VED_CHOICES)),
+                             x_range=Range1d(0, 1))
+ved_band_plot.toolbar_location = None
+ved_band_renderers = ved_band_plot.hbar_stack(
+    COVERAGE_BANDS, y="VED", height=0.62, source=ved_band_source,
+    color=[BANDS[k][1] for k in COVERAGE_BANDS], line_color="#FFFFFF", line_width=1,
+    legend_label=[BANDS[k][0] for k in COVERAGE_BANDS],
+)
+for _key, _renderer in zip(COVERAGE_BANDS, ved_band_renderers):
+    ved_band_plot.add_tools(HoverTool(renderers=[_renderer], tooltips=[
+        ("VED", "@VED"), ("Бүлэг", BANDS[_key][0]), ("Мөр", f"@{_key}_n{{0,0}}"), ("Хувь", f"@{_key}{{0.0%}}")]))
+ved_band_plot.xaxis.formatter = NumeralTickFormatter(format="0%")
+ved_band_plot.yaxis.major_label_text_font_size = "13pt"
+ved_band_plot.yaxis.major_label_text_font_style = "bold"
+ved_band_plot.ygrid.grid_line_color = None
+ved_band_plot.legend.orientation = "horizontal"
+ved_band_plot.legend.label_text_font_size = "8.5pt"
+ved_band_plot.legend.click_policy = "hide"
+ved_band_plot.add_layout(ved_band_plot.legend[0], "below")
+
+branch_plot = figure(title="Салбарын VED ангилал бүтэц — ROP (V / E / D), «Салбарын жагсаалт»-ын дарааллаар", y_range=[],
+                     height=610, sizing_mode="stretch_width", toolbar_location="above")
 branch_plot.hbar_stack(["VROP", "EROP", "DROP"], y="Branch", height=0.74, color=[VED_COLORS["V"], VED_COLORS["E"], VED_COLORS["D"]], source=branch_source, legend_label=["V", "E", "D"])
-branch_plot.add_tools(HoverTool(tooltips=[("Салбар", "@Branch"), ("Total ROP", "@ROP{0,0}"), ("V", "@VROP{0,0}"), ("E", "@EROP{0,0}"), ("D", "@DROP{0,0}")]))
+branch_plot.add_tools(HoverTool(tooltips=[("Салбар", "@Branch"), ("Нийт ROP", "@ROP{0,0}"), ("V", "@VROP{0,0} (@VShare{0%})"),
+                                         ("E", "@EROP{0,0} (@EShare{0%})"), ("D", "@DROP{0,0} (@DShare{0%})")]))
 branch_plot.legend.location = "bottom_right"
 branch_plot.xaxis.axis_label = "Corrected ROP"
 
-coverage_mapper = LinearColorMapper(palette=Viridis256, low=0, high=1)
+COVERAGE_LEVELS = ["branch_category", "branch", "category", "sku"]
+COVERAGE_METRICS = {
+    "AvgCoverage": "Дундаж хангалт — min(үлдэгдэл / ROP, 1)-ийн дундаж",
+    "CoveredShare": "Хангагдсан мөрийн хувь — үлдэгдэл ≥ ROP",
+    "FillRate": "ROP-жигнэсэн хангалт — Σ min(үлдэгдэл, ROP) / Σ ROP",
+}
+COVERAGE_SHORT = {"AvgCoverage": "Дундаж хангалт", "CoveredShare": "Хангагдсан мөр", "FillRate": "ROP-жигнэсэн"}
+coverage_level = RadioButtonGroup(labels=["Салбар × Категори", "Салбар", "Категори", "SKU"], active=0, width=460)
+coverage_metric = Select(title="Үзүүлэлт", value="AvgCoverage", options=list(COVERAGE_METRICS.items()), width=440)
+coverage_kpis = Div(text="", sizing_mode="stretch_width", height=120)
+
+# red (poor coverage) -> green (fully covered)
+coverage_mapper = LinearColorMapper(palette=list(reversed(RdYlGn11)), low=0, high=1, nan_color="#E5E7EB")
 coverage_plot = figure(
-    title="SKU coverage heatmap — салбар × категори",
-    x_range=[], y_range=[], height=650, sizing_mode="stretch_width",
+    title="Хангалт — салбар × категори (НИЙТ мөр / багана = нийлбэр)",
+    x_range=FactorRange(), y_range=FactorRange(), height=700, sizing_mode="stretch_width",
     toolbar_location="above",
 )
-coverage_plot.rect(
+coverage_cells = coverage_plot.rect(
     x="Category", y="Branch", width=1, height=1, source=coverage_source,
-    fill_color={"field": "Coverage", "transform": coverage_mapper},
-    line_color="#FFFFFF", line_width=0.5,
+    fill_color={"field": "Value", "transform": coverage_mapper},
+    line_color="Line", line_width="LineWidth",
 )
-coverage_plot.add_tools(HoverTool(tooltips=[
-    ("Салбар", "@Branch"),
-    ("Категори", "@Category"),
-    ("Coverage", "@Coverage{0.0%}"),
-    ("Covered SKU", "@CoveredSKU{0,0} / @SKUCount{0,0}"),
+coverage_plot.text(x="Category", y="Branch", text="Text", source=coverage_total_text, text_align="center",
+                   text_baseline="middle", text_font_size="8pt", text_font_style="bold", text_color="#111827")
+COVERAGE_TOOLTIPS = [
+    ("Дундаж хангалт", "@AvgCoverage{0.0%}"),
+    ("Хангагдсан мөр", "@CoveredRows{0,0} / @EligibleRows{0,0} (@CoveredShare{0.0%})"),
+    ("ROP-жигнэсэн", "@FillRate{0.0%}"),
+    ("SKU", "@SKUCount{0,0}"),
     ("ROP", "@ROP{0,0}"),
-    ("Inventory", "@Inventory{0,0}"),
-    ("Gap", "@Gap{0,0}"),
-]))
+    ("Хангагдсан (≤ ROP)", "@Filled{0,0}"),
+    ("Дутуу (ROP хүртэл)", "@Gap{0,0}"),
+]
+coverage_plot.add_tools(HoverTool(tooltips=[("Салбар", "@Branch"), ("Категори", "@Category"), *COVERAGE_TOOLTIPS],
+                                  renderers=[coverage_cells]))
 coverage_plot.add_layout(ColorBar(
-    color_mapper=coverage_mapper, label_standoff=8, title="SKU coverage", location=(0, 0),
+    color_mapper=coverage_mapper, label_standoff=8, title="Хангалт", location=(0, 0),
+    formatter=NumeralTickFormatter(format="0%"),
 ), "right")
-coverage_plot.xaxis.major_label_orientation = 0.8
+coverage_plot.xaxis.major_label_orientation = 0.6
 coverage_plot.xaxis.axis_label = "Категори"
 coverage_plot.yaxis.axis_label = "Салбар"
 coverage_plot.grid.grid_line_color = None
+coverage_empty = no_data_label()
+coverage_plot.add_layout(coverage_empty)
 
-coverage_columns = [
-    TableColumn(field="Branch", title="Салбар", width=220),
-    TableColumn(field="Category", title="Категори", width=180),
-    TableColumn(field="SKUCount", title="SKU", formatter=NumberFormatter(format="0,0"), width=75),
-    TableColumn(field="CoveredSKU", title="Covered SKU", formatter=NumberFormatter(format="0,0"), width=105),
-    TableColumn(field="Coverage", title="Coverage", formatter=NumberFormatter(format="0.0%"), width=95),
-    TableColumn(field="ROP", title="ROP", formatter=NumberFormatter(format="0,0"), width=95),
-    TableColumn(field="Inventory", title="Inventory", formatter=NumberFormatter(format="0,0"), width=110),
-    TableColumn(field="Gap", title="Gap", formatter=NumberFormatter(format="0,0"), width=100),
-]
-coverage_table = DataTable(
-    source=coverage_source, columns=coverage_columns, height=520,
-    sizing_mode="stretch_width", index_position=None,
+# Salbar / Kategori / SKU: one bar per group, worst first, dashed line = NIIT.
+coverage_bar_plot = figure(
+    title="", y_range=FactorRange(), x_range=Range1d(0, 1.15), height=400,
+    sizing_mode="stretch_width", toolbar_location="above", visible=False,
 )
+coverage_bars = coverage_bar_plot.hbar(
+    y="Label", right="Value", height=0.72, source=coverage_bar_source, line_color=None,
+    fill_color={"field": "Value", "transform": coverage_mapper},
+)
+coverage_bar_plot.text(x="Value", y="Label", text="ValueText", source=coverage_bar_source, x_offset=5,
+                       text_baseline="middle", text_font_size="9pt", text_color="#374151")
+coverage_bar_plot.add_tools(HoverTool(tooltips=[
+    ("", "@Label"), *COVERAGE_TOOLTIPS, ("Салбарын тоо", "@BranchCount{0,0}"),
+], renderers=[coverage_bars]))
+coverage_total_span = Span(location=0, dimension="height", line_color="#111827", line_dash="dashed", line_width=1.5)
+coverage_total_label = Label(x=0, y=6, y_units="screen", text="", text_font_size="9pt", text_color="#111827", x_offset=4)
+coverage_bar_plot.add_layout(coverage_total_span)
+coverage_bar_plot.add_layout(coverage_total_label)
+coverage_bar_plot.xaxis.formatter = NumeralTickFormatter(format="0%")
+coverage_bar_plot.ygrid.grid_line_color = None
+coverage_bar_plot.xgrid.grid_line_alpha = 0.15
+coverage_bar_empty = no_data_label()
+coverage_bar_plot.add_layout(coverage_bar_empty)
+
+_pct = NumberFormatter(format="0.0%")
+_int = NumberFormatter(format="0,0")
+COVERAGE_MEASURE_COLUMNS = [
+    TableColumn(field="EligibleRows", title="ROP-той мөр", formatter=_int, width=95),
+    TableColumn(field="CoveredRows", title="Хангагдсан мөр", formatter=_int, width=105),
+    TableColumn(field="AvgCoverage", title="Дундаж хангалт", formatter=_pct, width=105),
+    TableColumn(field="CoveredShare", title="Хангагдсан %", formatter=_pct, width=95),
+    TableColumn(field="FillRate", title="ROP-жигнэсэн", formatter=_pct, width=100),
+    TableColumn(field="ROP", title="ROP", formatter=_int, width=90),
+    TableColumn(field="Filled", title="Хангагдсан (≤ ROP)", formatter=_int, width=120),
+    TableColumn(field="Gap", title="Дутуу", formatter=_int, width=90),
+    TableColumn(field="Inventory", title="Нийт үлдэгдэл", formatter=_int, width=105),
+]
+COVERAGE_GROUP_COLUMNS = {
+    "branch_category": [TableColumn(field="BranchName", title="Салбар", width=230),
+                        TableColumn(field="Category", title="Категори", width=110),
+                        TableColumn(field="SKUCount", title="SKU", formatter=_int, width=70)],
+    "branch": [TableColumn(field="BranchName", title="Салбар", width=260),
+               TableColumn(field="SKUCount", title="SKU", formatter=_int, width=70)],
+    "category": [TableColumn(field="Category", title="Категори", width=160),
+                 TableColumn(field="SKUCount", title="SKU", formatter=_int, width=70),
+                 TableColumn(field="BranchCount", title="Салбар", formatter=_int, width=70)],
+    "sku": [TableColumn(field="SKU_ID", title="SKU ID", width=70),
+            TableColumn(field="SKU_Name", title="Нэр төрөл", width=320),
+            TableColumn(field="Category", title="Категори", width=100),
+            TableColumn(field="BranchCount", title="Салбар", formatter=_int, width=70)],
+}
+coverage_table = DataTable(
+    source=coverage_table_source, columns=COVERAGE_GROUP_COLUMNS["branch_category"] + COVERAGE_MEASURE_COLUMNS,
+    height=520, sizing_mode="stretch_width", index_position=None,
+)
+for _c in [c for cols in COVERAGE_GROUP_COLUMNS.values() for c in cols] + COVERAGE_MEASURE_COLUMNS:
+    _c.sortable = True
+
+# --- ABC / XYZ tab ------------------------------------------------------------
+# The class selectors filter this tab only; the global filters above apply too.
+abc_filter = MultiChoice(title="ABC ангилал", value=[], options=CLASS_ORDER["ABC"], width=280)
+xyz_filter = MultiChoice(title="XYZ ангилал", value=[], options=CLASS_ORDER["XYZ"], width=280)
+class_order = RadioButtonGroup(labels=["ABC-ээр", "XYZ-ээр"], active=0, width=200)
+abc_plot, abc_source, abc_empty = status_heatmap("ABC", CLASS_ORDER["ABC"])
+xyz_plot, xyz_source, xyz_empty = status_heatmap("XYZ", CLASS_ORDER["XYZ"])
+CLASS_SUMMARY_FIELDS = ["Class", "Rows", "SalesShare", "ROP", "Inventory", "Gap", "RiskRows", "CoveredShare"]
+_pct_or_dash = NumberFormatter(format="0.0%", nan_format="—")
+
+
+def class_summary_table(label: str) -> tuple[DataTable, ColumnDataSource]:
+    source = ColumnDataSource(data={f: [] for f in CLASS_SUMMARY_FIELDS})
+    columns = [
+        TableColumn(field="Class", title=label, width=95),
+        TableColumn(field="Rows", title="SKU × салбар", formatter=_int, width=90),
+        TableColumn(field="SalesShare", title="Борлуулалтын хувь", formatter=_pct_or_dash, width=115),
+        TableColumn(field="ROP", title="ROP", formatter=_int, width=75),
+        TableColumn(field="Inventory", title="Үлдэгдэл", formatter=_int, width=85),
+        TableColumn(field="Gap", title="ROP gap", formatter=_int, width=75),
+        TableColumn(field="RiskRows", title="Эрсдэлтэй мөр", formatter=_int, width=95),
+        TableColumn(field="CoveredShare", title="Хангагдсан %", formatter=_pct_or_dash, width=90),
+    ]
+    table = DataTable(source=source, columns=columns, height=185, sizing_mode="stretch_width",
+                      index_position=None, sortable=False)
+    return table, source
+
+
+abc_summary, abc_summary_source = class_summary_table("ABC")
+xyz_summary, xyz_summary_source = class_summary_table("XYZ")
+class_items_source = ColumnDataSource(data=dict())
+class_item_columns = [
+    TableColumn(field="SKU_ID", title="SKU ID", formatter=NumberFormatter(format="0"), width=70),
+    TableColumn(field="SKU_Name", title="Нэр төрөл", width=300),
+    TableColumn(field="BranchName", title="Салбар", width=220),
+    TableColumn(field="ABC", title="ABC", width=55),
+    TableColumn(field="XYZ", title="XYZ", width=55),
+    TableColumn(field="ClassSource", title="Ангиллын эх", width=100),
+    TableColumn(field="VED", title="VED", width=50),
+    TableColumn(field="Category", title="Категори", width=90),
+    TableColumn(field="Status", title="Status", width=115),
+    TableColumn(field="InventoryPosition", title="Inventory", formatter=NumberFormatter(format="0,0.00"), width=95),
+    TableColumn(field="ROP", title="ROP", formatter=_int, width=75),
+    TableColumn(field="ROPGap", title="Gap", formatter=NumberFormatter(format="0,0.00"), width=85),
+    TableColumn(field="CoverageRatio", title="Coverage", formatter=_pct, width=85),
+    TableColumn(field="Sales7M", title="7 сарын дун. борлуулалт", formatter=_int, width=150),
+]
+class_items_table = DataTable(source=class_items_source, columns=class_item_columns, height=520,
+                              sizing_mode="stretch_width", index_position=None)
+for _c in class_item_columns:
+    _c.sortable = True
+
+# --- Хугацаат tab ---------------------------------------------------------------
+# Batches with a valid expiry date still ahead, tracked per branch of
+# «Салбарын жагсаалт.txt» (file order). The global VED / category / search
+# filters apply; the ROP filters (status, gap, branch) do not.
+EXPIRY_LIST, EXPIRY_ALL = "__LIST__", "__ALL__"
+expiry_labels = dict(zip(*build_dim_expiry_status(ExpiryConfig.load())[["ExpiryStatus", "StatusLabel"]].T.values))
+EXPIRY_LABELS = {s: expiry_labels[s] for s in FUTURE_EXPIRY_STATUSES}
+def expiry_branch_options() -> list[tuple[str, str]]:
+    return ([(EXPIRY_LIST, f"Идэвхтэй салбарууд ({len(TRACKED)})"), (EXPIRY_ALL, "Бүх салбар (жагсаалтад байхгүй ч)")]
+            + [(data or listed, listed if data else f"{listed} — өгөгдөлгүй") for listed, data in TRACKED])
+
+
+expiry_branch = Select(title="Салбар (Салбарын жагсаалт)", value=EXPIRY_LIST, width=380, options=expiry_branch_options())
+expiry_status = MultiChoice(title="Хугацааны бүлэг", value=[], width=380,
+                            options=[(s, EXPIRY_LABELS[s]) for s in FUTURE_EXPIRY_STATUSES])
+expiry_kpis = Div(text="", sizing_mode="stretch_width", height=120)
+expiry_note = Div(text="", sizing_mode="stretch_width")
+
+expiry_month_source = ColumnDataSource(data={"Month": [], "Label": [], **{s: [] for s in FUTURE_EXPIRY_STATUSES}})
+expiry_month_plot = empty_figure("Дуусах сараар — үлдэгдлийн тоо (ширхэг)", 380, x_range=FactorRange())
+expiry_month_plot.vbar_stack(
+    FUTURE_EXPIRY_STATUSES, x="Month", width=0.8, source=expiry_month_source,
+    color=[EXPIRY_STATUS_COLORS[s] for s in FUTURE_EXPIRY_STATUSES],
+    legend_label=[EXPIRY_LABELS[s] for s in FUTURE_EXPIRY_STATUSES],
+)
+expiry_month_plot.add_tools(HoverTool(tooltips=[("Сар", "@Label"), ("Бүлэг", "$name"), ("Тоо", "@$name{0,0}")]))
+expiry_month_plot.y_range.start = 0
+expiry_month_plot.yaxis.formatter = NumeralTickFormatter(format="0,0")
+expiry_month_plot.xaxis.major_label_orientation = 0.9
+expiry_month_plot.xgrid.grid_line_color = None
+expiry_month_plot.legend.location = "top_right"
+expiry_month_plot.legend.label_text_font_size = "9pt"
+expiry_month_plot.legend.background_fill_alpha = 0.8
+expiry_month_empty = no_data_label()
+expiry_month_plot.add_layout(expiry_month_empty)
+
+# Branch tracking: one row per listed branch, in the list's order; the chart
+# ranks the branches with the most stock expiring within the critical window.
+EXPIRY_BRANCH_FIELDS = ["No", "BranchName", "BranchGroup", "Batches", "SKUs", "Qty", *FUTURE_EXPIRY_STATUSES, "Nearest", "AtRisk", "Tracking"]
+expiry_branch_source = ColumnDataSource(data={f: [] for f in EXPIRY_BRANCH_FIELDS})
+expiry_branch_columns = [
+    TableColumn(field="No", title="№", width=40),
+    TableColumn(field="BranchName", title="Салбар", width=260),
+    TableColumn(field="BranchGroup", title="Бүлэг", width=85),
+    TableColumn(field="Batches", title="Багц", formatter=_int, width=70),
+    TableColumn(field="SKUs", title="SKU", formatter=_int, width=65),
+    TableColumn(field="Qty", title="Нийт тоо", formatter=_int, width=85),
+    *[TableColumn(field=s, title=EXPIRY_LABELS[s], formatter=_int, width=90) for s in FUTURE_EXPIRY_STATUSES],
+    TableColumn(field="Nearest", title="Хамгийн ойр дуусах", formatter=DateFormatter(format="%Y-%m-%d"), width=125),
+    TableColumn(field="AtRisk", title="Эрсдэлтэй багц", formatter=_int, width=105),
+    TableColumn(field="Tracking", title="Хяналт", width=110),
+]
+expiry_branch_table = DataTable(source=expiry_branch_source, columns=expiry_branch_columns, height=420,
+                                sizing_mode="stretch_width", index_position=None, selectable=True)
+expiry_branch_plot_source = ColumnDataSource(data={"Branch": [], **{s: [] for s in FUTURE_EXPIRY_STATUSES}})
+expiry_branch_plot = empty_figure("Салбарууд — дуусах хугацааны бүлгээр (эхний 25, яаралтай нь дээрээ)", 560, y_range=FactorRange())
+expiry_branch_plot.hbar_stack(
+    FUTURE_EXPIRY_STATUSES, y="Branch", height=0.72, source=expiry_branch_plot_source,
+    color=[EXPIRY_STATUS_COLORS[s] for s in FUTURE_EXPIRY_STATUSES],
+    legend_label=[EXPIRY_LABELS[s] for s in FUTURE_EXPIRY_STATUSES],
+)
+expiry_branch_plot.add_tools(HoverTool(tooltips=[("Салбар", "@Branch"), ("Бүлэг", "$name"), ("Тоо", "@$name{0,0}")]))
+expiry_branch_plot.x_range.start = 0
+expiry_branch_plot.xaxis.formatter = NumeralTickFormatter(format="0,0")
+expiry_branch_plot.ygrid.grid_line_color = None
+expiry_branch_plot.legend.location = "bottom_right"
+expiry_branch_plot.legend.label_text_font_size = "9pt"
+expiry_branch_empty = no_data_label()
+expiry_branch_plot.add_layout(expiry_branch_empty)
+
+expiry_items_source = ColumnDataSource(data=dict())
+expiry_item_columns = [
+    TableColumn(field="SKU_ID", title="SKU ID", formatter=NumberFormatter(format="0"), width=70),
+    TableColumn(field="SKU_Name", title="Нэр төрөл", width=300),
+    TableColumn(field="BranchName", title="Салбар", width=230),
+    TableColumn(field="Category", title="Категори", width=90),
+    TableColumn(field="VED", title="VED", width=50),
+    TableColumn(field="ExpiryDate", title="Дуусах огноо", formatter=DateFormatter(format="%Y-%m-%d"), width=100),
+    TableColumn(field="DTE", title="Үлдсэн хоног", formatter=_int, width=95),
+    TableColumn(field="StatusLabel", title="Бүлэг", width=100),
+    TableColumn(field="Qty", title="Тоо", formatter=NumberFormatter(format="0,0.##"), width=75),
+    TableColumn(field="FEFORank", title="FEFO", formatter=_int, width=55),
+    TableColumn(field="ProjectedWaste", title="Төсөөлсөн хаягдал", formatter=NumberFormatter(format="0,0.##", nan_format="—"), width=120),
+    TableColumn(field="Risk", title="Эрсдэлтэй", width=80),
+]
+expiry_items_table = DataTable(source=expiry_items_source, columns=expiry_item_columns, height=520,
+                               sizing_mode="stretch_width", index_position=None)
+for _c in expiry_branch_columns + expiry_item_columns:
+    _c.sortable = True
 
 quality_plot = figure(title="Өгөгдлийн чанарын KPI", x_range=[], height=410, sizing_mode="stretch_width", toolbar_location=None)
 quality_plot.vbar(x="Metric", top="Value", width=0.68, color="Color", source=quality_source)
@@ -284,20 +615,30 @@ quality_plot.xaxis.major_label_orientation = 0.8
 quality_plot.y_range.start = 0
 quality_plot.grid.grid_line_alpha = 0.15
 
+STATUS_PILL = HTMLTemplateFormatter(template=(
+    '<span style="display:inline-block;padding:1px 9px;border-radius:10px;font-size:11.5px;font-weight:600;'
+    'color:<%= StatusColor %>;background:<%= StatusColor %>1F;border:1px solid <%= StatusColor %>55;"><%= value %></span>'))
+RATIO_BAR = HTMLTemplateFormatter(template=(
+    '<div style="display:flex;align-items:center;gap:6px;height:100%;">'
+    '<div style="position:relative;flex:1;height:8px;background:#E5E7EB;border-radius:4px;overflow:hidden;">'
+    '<div style="width:<%= BarPct %>%;height:100%;background:<%= BandColor %>;"></div>'
+    '<div style="position:absolute;left:33.3%;top:0;bottom:0;width:1px;background:#111827;opacity:.45;"></div></div>'
+    '<span style="min-width:42px;text-align:right;font-variant-numeric:tabular-nums;"><%= RatioText %></span></div>'))
 main_columns = [
-    TableColumn(field="SKU_ID", title="SKU ID", formatter=NumberFormatter(format="0"), width=70),
-    TableColumn(field="SKU_Name", title="Нэр төрөл", formatter=StringFormatter(), width=330),
-    TableColumn(field="BranchName", title="Салбар", width=230),
-    TableColumn(field="VED", title="VED", width=55),
-    TableColumn(field="Category", title="Категори", width=90),
-    TableColumn(field="Status", title="Status", width=115),
-    TableColumn(field="InventoryPosition", title="Inventory", formatter=NumberFormatter(format="0,0.00"), width=95),
-    TableColumn(field="ROP", title="ROP", formatter=NumberFormatter(format="0,0"), width=80),
-    TableColumn(field="ROPGap", title="Gap", formatter=NumberFormatter(format="0,0.00"), width=90),
-    TableColumn(field="CoverageRatio", title="Coverage", formatter=NumberFormatter(format="0.0%"), width=90),
-    TableColumn(field="ROP_Confidence", title="Confidence", width=85),
-    TableColumn(field="Supplier", title="Нийлүүлэгч", width=220),
+    TableColumn(field="SKU_ID", title="SKU ID", formatter=NumberFormatter(format="0"), width=65),
+    TableColumn(field="SKU_Name", title="Нэр төрөл", formatter=StringFormatter(), width=320),
+    TableColumn(field="BranchName", title="Салбар", width=220),
+    TableColumn(field="VED", title="VED", width=45),
+    TableColumn(field="Category", title="Категори", width=85),
+    TableColumn(field="Status", title="Status", formatter=STATUS_PILL, width=125),
+    TableColumn(field="InventoryPosition", title="Үлдэгдэл", formatter=NumberFormatter(format="0,0.[00]"), width=80),
+    TableColumn(field="ROP", title="ROP", formatter=NumberFormatter(format="0,0"), width=65),
+    TableColumn(field="RatioText", title="Үлдэгдэл ÷ ROP (зураас = ROP)", formatter=RATIO_BAR, width=190),
+    TableColumn(field="ROPGap", title="Дутуу", formatter=NumberFormatter(format="0,0.[00]"), width=75),
+    TableColumn(field="ROP_Confidence", title="Confidence", width=80),
+    TableColumn(field="Supplier", title="Нийлүүлэгч", width=200),
 ]
+table_title = Div(text="", sizing_mode="stretch_width")
 main_table = DataTable(source=table_source, columns=main_columns, height=540, sizing_mode="stretch_width", index_position=None, selectable=True)
 detail_panel = Div(text="", sizing_mode="stretch_width")
 
@@ -392,14 +733,22 @@ methodology = Div(text="""
 <li>Z<sub>final</sub> = MAX(Z VED, Z ABC–XYZ)</li>
 <li>Inventory Position = On Hand + On Order − Backorder</li>
 <li>Status: тасарсан, ROP-оос доош, хэвийн, илүүдэл, өгөгдөл алга, ROP байхгүй</li>
+<li><b>Дундаж борлуулалтгүй мөр</b> (ROP файлд «Сарын дундаж тоо» хоосон эсвэл 0, эсвэл ROP файлд огт байхгүй SKU × салбар):
+ROP тооцохгүй, ROP-ийн тайланд огт оруулахгүй — «ROP байхгүй», «Өгөгдөл алга»-д ч тоологдохгүй. Хугацаат табад харагдана.</li>
 <li>Дэлгэрэнгүй ROP байхгүй SKU-д fallback ROP хадгалсан бөгөөд confidence = “Бага”.</li>
+<li><b>Идэвхтэй салбарууд</b>: бүх таб, KPI, тренд зөвхөн «Салбарын жагсаалт.txt»-д буй салбаруудыг хамарна (файлыг засаад дашбоардыг дахин ачаална).</li>
 </ul>
 <h3 style="color:#12263A;">Өгөгдлийн загвар (star schema)</h3>
 <p>Өгөгдөл <code>data/*.parquet</code> файлд хадгалагдаж, DuckDB-ээр SQL-ээр шүүгдэнэ.
 Fact хүснэгтүүд (<code>fact_sku_status</code>, <code>fact_status_history</code>, <code>fact_branch_rop</code>) зөвхөн түлхүүр ба хэмжигдэхүүн агуулна;
 барааны нэр, категори, салбарын нэр зэрэг тайлбар мэдээлэл <code>dim_sku</code>, <code>dim_branch</code>, <code>dim_date</code> хүснэгтээс холбогдоно.
 Категори нь <code>SKU category.csv</code> файлаас авна; тохирохгүй SKU-г <code>data/category_review.csv</code>-д жагсаана.
+VED нь <code>VED ангилал.csv</code> файлаас авна: файлд байгаа SKU тэр VED-ийг бүх салбар, бүх snapshot-д авч, файлд байхгүй SKU ROP файлын VED-ээ хадгална.
+ROP ба Z VED нь ROP файлд тооцоолсон хэвээр (тооцоонд ашигласан VED <code>VED_ROP</code> баганад); ROP файлын VED-ээс өөр болсон SKU-г <code>data/ved_review.csv</code>-д жагсаана.
 Snapshot бүр <code>fact_status_history</code>-д огноогоор (DateKey) хадгалагдаж, «Тренд» табад харагдана.</p>
+<h3 style="color:#12263A;">ABC / XYZ</h3>
+<p>ROP файлын салбар бүрийн ангилал (ROP файлд ангилалгүй мөрийг «ABC XYZ.xlsx» файлаас нөхнө; «Ангиллын эх» баганад): <b>ABC</b> — борлуулалтын дүнгээр (A — борлуулалтын дийлэнх), <b>XYZ</b> — эрэлтийн хэлбэлзлээр (X — тогтвортой, Z — хамгийн тогтворгүй).
+«ABC / XYZ» таб хоёр ангиллыг тус тусад нь status-аар задалж, SKU × салбарын жагсаалтыг ангиллаар эрэмбэлнэ.</p>
 <h3 style="color:#12263A;">Автомат шинэчлэл</h3>
 <p>Үлдэгдлийн XLSX/XLSB/CSV файлыг дээрх upload хэсэгт оруулахад Python ETL нэр, SKU ID, салбар, үлдэгдлийн багануудыг таньж, alias mapping ашиглан холбож, статус болон бүх графикийг шинэчилнэ.</p>
 </div>
@@ -420,7 +769,6 @@ def current_filters() -> Filters:
         statuses=tuple(status_filter.value),
         veds=tuple(ved_filter.value),
         categories=tuple(category_filter.value),
-        confidences=tuple(confidence_filter.value),
         branch=None if branch_filter.value == "ALL" else branch_filter.value,
         critical_only=bool(critical_only.active),
         search=search_input.value or "",
@@ -437,6 +785,7 @@ def update_kpis(f: Filters) -> None:
     html += card("Total ROP", f"{k['total_rop']:,.0f}", "Ашиглах ROP", "#0F766E")
     html += card("ROP gap", f"{k['rop_gap']:,.0f}", "Нөхөх шаардлагатай", "#F97316")
     html += card("Critical V/E", f"{k['critical']:,.0f}", "Тасарсан эсвэл ROP-оос доош", "#B91C1C")
+    html += card("ROP-оос илүү нөөц", f"{k['excess']:,.0f}", "Σ (үлдэгдэл − ROP), ROP-той мөр", "#2563EB")
     html += card("Mapping rate", f"{mapping_rate:.1%}", state.get("source_file", ""), "#7C3AED")
     html += "</div>"
     kpi_container.text = html
@@ -453,103 +802,394 @@ def update_freshness() -> None:
         f'<span><b style="color:#12263A;">Эх файл:</b> {state.get("source_file", "")}</span>'
         f'<span><b style="color:#12263A;">Mapping:</b> {rate:.1%}</span>'
         f'<span><b style="color:#12263A;">Scope:</b> {db.scope()}</span>'
+        f'<span style="margin-left:auto;color:#0F766E;">{state.get("live_text", "")}</span>'
         '</div>'
     )
 
 
+def _share_text(share: float) -> str:
+    return "<0.1%" if 0 < share < 0.001 else f"{share:.1%}"
+
+
 def update_status_chart(f: Filters) -> None:
-    counts = db.status_counts(f)
-    total = max(int(counts.sum()), 1)
+    counts = db.status_counts(f).reindex(GRID_STATUSES)
+    total = int(counts.sum())
+    shares = counts / total if total else counts * 0.0
     status_source.data = {
         "Status": list(counts.index),
         "Count": counts.astype(int).tolist(),
-        "Angle": (counts / total * 2 * np.pi).tolist(),
+        "Share": shares.tolist(),
+        "Label": [f"{c:,}  ·  {_share_text(s)}" for c, s in zip(counts, shares)],
         "Color": [STATUS_COLORS[s] for s in counts.index],
+        # data-quality statuses are muted so the operational ones stand out
+        "Alpha": [0.35 if s in DATA_QUALITY_STATUSES else 0.95 for s in counts.index],
     }
+    status_plot.x_range.end = max(total and counts.max() * 1.3, 1)
+    status_empty.visible = total == 0
+
+
+def fill_status_heatmap(plot, source: ColumnDataSource, empty: Label, cells: pd.DataFrame, classes: list[str]) -> None:
+    """cells: Class, Status, Count, Share, Intensity, Gap, Excess (MetricsCalculator.heatmap_cells)."""
+    cells = cells[cells["Status"].isin(GRID_STATUSES)]
+    source.data = {
+        "Class": cells["Class"].tolist(),
+        "Status": cells["Status"].tolist(),
+        "Count": cells["Count"].astype(int).tolist(),
+        "Share": cells["Share"].tolist(),
+        "Intensity": cells["Intensity"].tolist(),
+        "Gap": cells["Gap"].astype(float).tolist(),
+        "Excess": cells["Excess"].astype(float).tolist(),
+        "Text": [f"{c:,}\n{s:.0%}" for c, s in zip(cells["Count"], cells["Share"])],
+        "TextColor": ["#FFFFFF" if i > 0.55 else "#111827" for i in cells["Intensity"]],
+    }
+    plot.x_range.factors = [s for s in GRID_STATUSES if s in set(cells["Status"])] or GRID_STATUSES
+    plot.y_range.factors = list(reversed([c for c in classes if c in set(cells["Class"])] or classes))
+    empty.visible = cells.empty
 
 
 def update_ved_chart(f: Filters) -> None:
-    ved = db.ved_summary(f)
-    ved_source.data = {
-        "VED": ved["VED"].tolist(),
-        "Critical": ved["Critical"].astype(int).tolist(),
-        "Gap": ved["Gap"].astype(float).tolist(),
-        "Color": [VED_COLORS[v] for v in ved["VED"]],
-    }
+    cells = MetricsCalculator.heatmap_cells(db.ved_status(f).rename(columns={"VED": "Class"}))
+    cells = cells[cells["Class"].isin(VED_CHOICES)]
+    fill_status_heatmap(ved_plot, ved_source, ved_empty, cells, VED_CHOICES)
+
+
+def class_filters(f: Filters) -> Filters:
+    """The global filters plus this tab's ABC / XYZ selection."""
+    return replace(f, abc=tuple(abc_filter.value), xyz=tuple(xyz_filter.value))
+
+
+def update_class_tab(f: Filters) -> None:
+    cf = class_filters(f)
+    breakdown = db.class_breakdown(cf)
+    for column, (plot, source, empty), summary in [
+        ("ABC", (abc_plot, abc_source, abc_empty), abc_summary_source),
+        ("XYZ", (xyz_plot, xyz_source, xyz_empty), xyz_summary_source),
+    ]:
+        cells, classes = MetricsCalculator.class_rollup(breakdown, column, CLASS_ORDER[column])
+        fill_status_heatmap(plot, source, empty, cells, CLASS_ORDER[column])
+        summary.data = ColumnDataSource.from_df(classes[CLASS_SUMMARY_FIELDS])
+    order = "XYZ" if class_order.active == 1 else "ABC"
+    class_items_source.data = ColumnDataSource.from_df(db.class_items(cf, order))
+
+
+def expiry_scope() -> tuple[str, ...]:
+    """BranchNames the Хугацаат tab covers: the tracked list, every branch (),
+    or the one selected branch."""
+    if expiry_branch.value == EXPIRY_LIST:
+        return TRACKED_NAMES or tuple(listed for listed, _ in TRACKED)
+    if expiry_branch.value == EXPIRY_ALL:
+        return ()
+    return (expiry_branch.value,)
+
+
+def _date_text(value) -> str:
+    return "—" if value is None or pd.isna(value) else pd.Timestamp(value).strftime("%Y-%m-%d")
+
+
+def update_expiry(f: Filters) -> None:
+    branches, statuses = expiry_scope(), tuple(expiry_status.value)
+    k = db.expiry_kpis(f, branches, statuses)
+    html = '<div style="display:flex;gap:12px;flex-wrap:wrap;width:100%;box-sizing:border-box;font-family:Segoe UI,Arial,sans-serif;">'
+    html += card("Хугацаатай багц", f"{k['batches']:,.0f}", f"{k['skus']:,.0f} SKU · {k['branches']:,.0f} салбар", "#1F4E5F")
+    html += card("Нийт үлдэгдэл", f"{k['qty']:,.0f}", "Хугацаа нь дуусаагүй, ширхэг", "#2563EB")
+    html += card(EXPIRY_LABELS["CRITICAL"], f"{k['critical_qty']:,.0f}", f"{k['critical_batches']:,.0f} багц — яаралтай", EXPIRY_STATUS_COLORS["CRITICAL"])
+    html += card(EXPIRY_LABELS["WARNING"], f"{k['warning_qty']:,.0f}", "ширхэг", EXPIRY_STATUS_COLORS["WARNING"])
+    html += card("Эрсдэлтэй багц", f"{k['at_risk_batches']:,.0f}", f"Төсөөлсөн хаягдал {k['projected_waste']:,.0f} ширхэг", "#7F1D1D")
+    html += card("Хамгийн ойр дуусах", _date_text(k["nearest"]), "огноо", "#6B7280")
+    expiry_kpis.text = html + "</div>"
+
+    # Monthly profile: the next 24 months. Later dates would dwarf them as one
+    # bar, so their total goes in the title instead.
+    months = db.expiry_months(f, branches, statuses)
+    later = float(months.loc[months["Month"].isna(), "Qty"].sum())
+    months = months[months["Month"].notna()]
+    expiry_month_plot.title.text = f"Дуусах сараар — ирэх 24 сар, үлдэгдлийн тоо (ширхэг) · 24+ сарын дараа: {later:,.0f}"
+    labels = months["Month"].map(lambda m: pd.Timestamp(m).strftime("%Y-%m"))
+    wide = months.assign(Label=labels).pivot_table(index="Label", columns="ExpiryStatus", values="Qty", aggfunc="sum", sort=False)
+    wide = wide.reindex(columns=FUTURE_EXPIRY_STATUSES).fillna(0)
+    expiry_month_source.data = {"Month": list(wide.index), "Label": list(wide.index),
+                                **{s: wide[s].tolist() for s in FUTURE_EXPIRY_STATUSES}}
+    expiry_month_plot.x_range.factors = list(wide.index)
+    expiry_month_empty.visible = wide.empty
+
+    # Branch tracking table: the tracked list in file order (branches without
+    # batches included), or every branch with batches, most urgent first.
+    by_branch = db.expiry_by_branch(f, branches, statuses)
+    if expiry_branch.value == EXPIRY_LIST:
+        listed = pd.DataFrame([(i + 1, data or name, data is not None) for i, (name, data) in enumerate(TRACKED)],
+                              columns=["No", "BranchName", "InWarehouse"])
+        table = listed.merge(by_branch, on="BranchName", how="left")
+        table["Tracking"] = np.select(
+            [~table["InWarehouse"], table["Batches"].isna()], ["Өгөгдөлгүй салбар", "Хугацаатай бараагүй"], "Хянагдаж буй")
+    else:
+        table = by_branch.sort_values(["CRITICAL", "WARNING"], ascending=False).reset_index(drop=True)
+        table.insert(0, "No", range(1, len(table) + 1))
+        tracked = set(TRACKED_NAMES)
+        table["Tracking"] = np.where(table["BranchName"].isin(tracked), "Жагсаалтад", "Жагсаалтад байхгүй")
+    for col in ["Batches", "SKUs", "Qty", "AtRisk", *FUTURE_EXPIRY_STATUSES]:
+        table[col] = pd.to_numeric(table.get(col), errors="coerce").fillna(0)
+    table["Nearest"] = pd.to_datetime(table.get("Nearest"), errors="coerce")
+    table["BranchGroup"] = table.get("BranchGroup").fillna("")
+    expiry_branch_source.data = ColumnDataSource.from_df(table[EXPIRY_BRANCH_FIELDS])
+
+    ranked = by_branch.sort_values(["CRITICAL", "WARNING", "Qty"], ascending=False).head(25)
+    expiry_branch_plot_source.data = {"Branch": ranked["BranchName"].tolist(),
+                                      **{s: ranked[s].astype(float).tolist() for s in FUTURE_EXPIRY_STATUSES}}
+    expiry_branch_plot.y_range.factors = ranked["BranchName"].tolist()[::-1]
+    expiry_branch_plot.height = max(260, 20 * len(ranked) + 120)
+    expiry_branch_empty.visible = ranked.empty
+
+    items = db.expiry_items(f, branches, statuses)
+    items["ExpiryDate"] = pd.to_datetime(items["ExpiryDate"])
+    items["StatusLabel"] = items["ExpiryStatus"].map(EXPIRY_LABELS)
+    items["Risk"] = np.where(items["AtRisk"].fillna(False).astype(bool), "Тийм", "")
+    expiry_items_source.data = ColumnDataSource.from_df(items.drop(columns=["AtRisk", "ExpiryStatus", "StockValue"]))
+
+    info = metadata.get("expiry") or {}
+    missing = [listed for listed, data in TRACKED if data is None]
+    note = (f"Үлдэгдлийн огноо: <b>{info.get('snapshot_date', '—')}</b> · "
+            f"хугацаа уншигдсан мөр: <b>{info.get('expiry_completeness', 0):.1%}</b> · "
+            f"хүснэгтэд эхний 3,000 багц (хамгийн ойр дуусахаас эхлэн).")
+    if missing:
+        note += f"<br>Жагсаалтын {len(missing)} салбар агуулахын өгөгдөлд олдсонгүй: {', '.join(missing)}."
+    if not info.get("has_expiry_dates", False):
+        note += ("<br><b style='color:#B91C1C;'>Сүүлийн үлдэгдлийн файлд хугацааны багана олдсонгүй</b> "
+                 "(«Сери.Хүртэл хүчинтэй», «Огноо», «Date», «Expiry Date», «Хугацаа»).")
+    expiry_note.text = f"<div style='font-size:12px;color:#4B5563;padding:4px 0;'>{note}</div>"
+
+
+def expiry_branch_tap_callback(attr: str, old, new) -> None:
+    """Click a branch row to drill into that branch."""
+    if not new:
+        return
+    name = expiry_branch_source.data["BranchName"][new[0]]
+    expiry_branch_source.selected.indices = []
+    if name in {v for v, _ in expiry_branch.options}:
+        expiry_branch.value = name
+
+
+def current_top_measure(f: Filters) -> str:
+    mode = TOP_MODES[top_mode.active]
+    return MetricsCalculator.auto_top_measure(f.statuses, f.critical_only) if mode == "auto" else mode
 
 
 def update_top_chart(f: Filters) -> None:
-    risk = db.top_shortages(f)
-    names = [str(x)[:55] for x in risk["SKU_Name"]]
-    branches = risk["BranchName"].fillna("").astype(str).tolist()
-    labels = MetricsCalculator.unique_bar_labels(names, branches)
+    measure = current_top_measure(f)
+    level = "sku" if top_level.active == 1 else "row"
+    items = db.top_items(f, measure, level)
+    names = [str(x)[:55] for x in items["SKU_Name"]]
+    if level == "sku":
+        branches = [f"{int(b)} салбар" for b in items["Branches"]]
+        labels = MetricsCalculator.unique_bar_labels(names, [str(i) for i in items["SKU_ID"]])
+    else:
+        branches = items["BranchName"].astype(object).fillna("").astype(str).tolist()
+        labels = MetricsCalculator.unique_bar_labels(names, branches)
+    veds = items["VED"].fillna("Тодорхойгүй").astype(str).tolist()
     top_source.data = {
-        "Name": names,
         "Label": labels,
+        "Name": names,
         "Branch": branches,
-        "Gap": risk["ROPGap"].fillna(0).tolist(),
-        "WeightedGap": risk["WeightedGap"].fillna(0).tolist(),
-        "VED": risk["VED"].fillna("Тодорхойгүй").tolist(),
-        "Status": risk["Status"].fillna("").tolist(),
-        "OnHand": risk["InventoryPosition"].fillna(0).tolist(),
-        "ROP": risk["ROP"].fillna(0).tolist(),
-        "Color": [VED_COLORS.get(v, "#6B7280") for v in risk["VED"].fillna("Тодорхойгүй")],
+        "VED": veds,
+        "Status": items["Status"].astype(object).fillna("—").astype(str).tolist(),
+        "Value": items["Value"].astype(float).tolist(),
+        "ValueText": [f"{v:,.0f}" for v in items["Value"]],
+        "Gap": items["ROPGap"].fillna(0).tolist(),
+        "OnHand": items["InventoryPosition"].fillna(0).tolist(),
+        "ROP": items["ROP"].fillna(0).tolist(),
+        "Color": [VED_COLORS.get(v, "#6B7280") for v in veds],
     }
     shortage_plot.y_range.factors = labels[::-1]
+    shortage_plot.x_range.end = float(items["Value"].max()) * 1.12 if len(items) else 1
+    title, axis = TOP_TITLES[measure]
+    suffix = " · SKU (салбаруудын нийт)" if level == "sku" else " · SKU × салбар"
+    shortage_plot.title.text = title + suffix + (" (автомат)" if top_mode.active == 0 else "")
+    shortage_plot.xaxis.axis_label = axis
+    top_empty.visible = items.empty
 
 
-def update_scatter(f: Filters) -> None:
-    # Density layer: every plotted SKU binned into hexagons.
-    density = db.density_points(f)
-    q, r, counts = MetricsCalculator.hexbin_log(density["ROP"], density["InventoryPosition"], HEX_SIZE)
-    hex_source.data = {"q": q, "r": r, "counts": counts}
-    hex_color_mapper.high = max(int(max(counts)) if counts else 1, 1)
+def _ratio_text(inventory, rop, band: str) -> str:
+    if band in ("NODATA", "NOROP") or not rop or pd.isna(rop):
+        return "—"
+    ratio = max(float(inventory or 0), 0.0) / float(rop)
+    return f"{ratio:.0%}" if ratio < 1 else f"{ratio:.1f}×"
 
-    # Point layer: only stocked-out / below-ROP SKUs, capped at 3000 by priority.
-    risk = db.risk_points(f)
-    inv = risk["InventoryPosition"].fillna(0).clip(lower=0)
-    rop = risk["ROP"].fillna(0).clip(lower=0)
-    scatter_source.data = {
-        "Name": risk["SKU_Name"].astype(str).tolist(),
-        "ROPPlot": np.log10(rop + 1).tolist(),
-        "InvPlot": np.log10(inv + 1).tolist(),
-        "ROP": rop.tolist(),
-        "Inventory": inv.tolist(),
-        "Gap": risk["ROPGap"].fillna(0).tolist(),
-        "VED": risk["VED"].fillna("Тодорхойгүй").tolist(),
-        "Status": risk["Status"].fillna("").tolist(),
-        "Color": [STATUS_COLORS.get(s, "#6B7280") for s in risk["Status"]],
+
+def update_sku_tab(f: Filters) -> None:
+    bands = db.coverage_bands(f)
+    by_band = bands.groupby("Band")[["Rows", "SKUs", "Gap", "Excess"]].sum()
+    shown = [k for k in COVERAGE_BANDS if k not in ("NOROP", "NODATA") or by_band["Rows"].get(k, 0) > 0]
+    by_band = by_band.reindex(shown).fillna(0)
+    total = float(by_band["Rows"].sum())
+    selected = sku_band.value
+    band_source.data = {
+        "Key": shown,
+        "Label": [BANDS[k][0] for k in shown],
+        "Rows": by_band["Rows"].tolist(),
+        # a distinct SKU count summed over VED classes; a SKU sits in one VED class
+        "SKUs": by_band["SKUs"].tolist(),
+        "Share": (by_band["Rows"] / total if total else by_band["Rows"] * 0).tolist(),
+        "Text": [f"{r:,.0f}  ·  {_share_text(r / total) if total else '0%'}" for r in by_band["Rows"]],
+        "Color": [BANDS[k][1] for k in shown],
+        "Alpha": [1.0 if not selected or k == selected else 0.3 for k in shown],
+        "Desc": [BANDS[k][2] for k in shown],
+        "Gap": by_band["Gap"].tolist(),
+        "Excess": by_band["Excess"].tolist(),
     }
+    band_plot.x_range.factors = [BANDS[k][0] for k in shown]
+    band_plot.y_range.end = max(float(by_band["Rows"].max()) * 1.15, 1) if len(by_band) else 1
+    band_empty.visible = total == 0
+
+    ved = bands[bands["VED"].isin(VED_CHOICES)].pivot_table(index="VED", columns="Band", values="Rows", aggfunc="sum")
+    ved = ved.reindex(index=VED_CHOICES, columns=COVERAGE_BANDS).fillna(0)
+    shares = ved.div(ved.sum(axis=1).where(lambda x: x > 0), axis=0).fillna(0)
+    for item in ved_band_plot.legend[0].items:  # legend lists only the bands on the chart
+        item.visible = item.label.value in {BANDS[k][0] for k in shown}
+    ved_band_source.data = {"VED": VED_CHOICES, **{k: shares[k].tolist() for k in COVERAGE_BANDS},
+                            **{f"{k}_n": ved[k].tolist() for k in COVERAGE_BANDS}}
+
+    # KPI strip: what needs action (short), how much, and what is tied up (excess)
+    rows = by_band["Rows"]
+    short = float(rows.reindex(SHORT_BANDS).fillna(0).sum())
+    ok = float(rows.get("OK", 0))
+    over = float(rows.get("OVER", 0) + rows.get("HIGH", 0))
+    v_short = float(ved.loc["V", list(SHORT_BANDS)].sum()) if "V" in ved.index else 0.0
+    v_total = float(ved.loc["V"].sum()) if "V" in ved.index else 0.0
+    pct = lambda n: _share_text(n / total) if total else "0%"  # noqa: E731
+    html = '<div style="display:flex;gap:12px;flex-wrap:wrap;width:100%;box-sizing:border-box;font-family:Segoe UI,Arial,sans-serif;">'
+    html += card("ROP-оос доош мөр", f"{short:,.0f}", f"{pct(short)} · нөхөх шаардлагатай", BANDS["LOW"][1])
+    html += card("ROP хүртэл дутуу", f"{by_band['Gap'].sum():,.0f}", "ширхэг — захиалах хэмжээ", BANDS["BELOW"][1])
+    html += card("V бараа ROP-оос доош", f"{v_short:,.0f}", f"V мөрийн {_share_text(v_short / v_total) if v_total else '0%'}", VED_COLORS["V"])
+    html += card("Хэвийн нөөц", f"{ok:,.0f}", f"{pct(ok)} · ROP-ийн 1–2 дахин", BANDS["OK"][1])
+    html += card("ROP-оос 2+ дахин их", f"{over:,.0f}", f"{pct(over)} · илүүдэл {by_band['Excess'].sum():,.0f} ширхэг", BANDS["OVER"][1])
+    sku_kpis.text = html + "</div>"
+
+    items = db.table(replace(f, band=selected))
+    items["StatusColor"] = items["Status"].map(STATUS_COLORS).fillna("#6B7280")
+    items["BandColor"] = items["Band"].map(lambda k: BANDS.get(k, ("", "#9CA3AF"))[1])
+    ratio = (items["InventoryPosition"].clip(lower=0) / items["ROP"].where(items["ROP"] > 0)).fillna(0)
+    items["BarPct"] = (ratio / 3).clip(upper=1).mul(100).round(1)  # full bar = 3x ROP
+    items["Supplier"] = items["Supplier"].replace("", np.nan).fillna("—")
+    items["RatioText"] = [_ratio_text(i, r, b) for i, r, b in zip(items["InventoryPosition"], items["ROP"], items["Band"])]
+    table_source.data = ColumnDataSource.from_df(items)
+    table_title.text = (
+        "<div style='margin:6px 0 2px 0;padding-top:14px;border-top:1px solid #E5E7EB;font-size:15px;font-weight:700;color:#12263A;'>"
+        f"Жагсаалт — {BANDS[selected][0] if selected else 'бүх бүлэг'}"
+        "<span style='font-weight:400;font-size:12px;color:#6B7280;'> · хамгийн яаралтай нь эхэнд, эхний 1,000 мөр · мөр дээр дарж дэлгэрэнгүйг харна</span></div>"
+    )
+
+
+def band_tap_callback(attr: str, old, new) -> None:
+    """Click a band to list its rows; click it again to show every band."""
+    if not new:
+        return
+    key = band_source.data["Key"][new[0]]
+    band_source.selected.indices = []
+    sku_band.value = "" if sku_band.value == key else key
 
 
 def update_branch_chart() -> None:
+    """Every active branch in list order (branches without ROP rows at 0)."""
     group = db.branch_exposure()
+    if TRACKED_NAMES:
+        group = group.set_index("Branch").reindex(list(TRACKED_NAMES)).fillna(0).rename_axis("Branch").reset_index()
+    total = group["ROP"].where(group["ROP"] > 0)
+    for v in "VED":
+        group[f"{v}Share"] = (group[f"{v}ROP"] / total).fillna(0)
     labels = group["Branch"].astype(str).tolist()
-    branch_source.data = {col: group[col].tolist() for col in ["Branch", "ROP", "VROP", "EROP", "DROP"]}
+    branch_source.data = {col: group[col].tolist() for col in branch_source.data}
     branch_plot.y_range.factors = labels[::-1]
+    branch_plot.height = max(400, 20 * len(labels) + 120)
+
+
+def _pct_text(value: float) -> str:
+    return "—" if value is None or pd.isna(value) else f"{value:.1%}"
 
 
 def update_coverage(f: Filters) -> None:
-    grouped = MetricsCalculator.finalize_coverage(db.coverage(f))
-    if grouped.empty:
-        coverage_source.data = {key: [] for key in coverage_source.data}
-        coverage_plot.x_range.factors = []
-        coverage_plot.y_range.factors = []
-        return
+    level = COVERAGE_LEVELS[coverage_level.active]
+    metric = coverage_metric.value
+    df = MetricsCalculator.finalize_coverage(db.coverage_summary(f, level))
+    grand = df[df["TotalLevel"] == df["TotalLevel"].max()] if len(df) else df
+    total = grand.iloc[0] if len(grand) and grand.iloc[0]["EligibleRows"] > 0 else None
+    groups = df[df["TotalLevel"] == 0]
+    df["Value"] = df[metric]
+
+    # KPI strip: all three coverage measures for the whole filtered selection
+    html = '<div style="display:flex;gap:12px;flex-wrap:wrap;width:100%;box-sizing:border-box;font-family:Segoe UI,Arial,sans-serif;">'
+    for key, short in COVERAGE_SHORT.items():
+        accent = "#1F4E5F" if key == metric else "#D1D5DB"
+        html += card(f"НИЙТ {short}", _pct_text(total[key]) if total is not None else "—", COVERAGE_METRICS[key].split(" — ")[1], accent)
+    if total is not None:
+        html += card("ROP-той мөр", f"{total['EligibleRows']:,.0f}", f"хангагдсан {total['CoveredRows']:,.0f}", "#0F766E")
+        html += card("Дутуу (ROP хүртэл)", f"{total['Gap']:,.0f}", "Σ (ROP − хангагдсан)", "#F97316")
+    coverage_kpis.text = html + "</div>"
+
+    table = pd.concat([grand, groups.sort_values(metric, na_position="last")], ignore_index=True)
+    coverage_table.columns = COVERAGE_GROUP_COLUMNS[level] + COVERAGE_MEASURE_COLUMNS
+    coverage_table_source.data = ColumnDataSource.from_df(table.drop(columns=["TotalLevel", "RatioSum", "Value"], errors="ignore"))
+
+    heat = level == "branch_category"
+    coverage_plot.visible = heat
+    coverage_bar_plot.visible = not heat
+    if heat:
+        update_coverage_heatmap(df)
+    else:
+        update_coverage_bars(groups, level, metric, total)
+
+
+def update_coverage_heatmap(df: pd.DataFrame) -> None:
+    cells = df[df["EligibleRows"] > 0] if len(df) else df
+    is_total = (cells["BranchName"] == TOTAL) | (cells["Category"] == TOTAL)
     coverage_source.data = {
-        "Branch": grouped["BranchName"].tolist(),
-        "Category": grouped["Category"].tolist(),
-        "Coverage": grouped["Coverage"].fillna(0).tolist(),
-        "SKUCount": grouped["SKUCount"].astype(int).tolist(),
-        "CoveredSKU": grouped["CoveredSKU"].astype(int).tolist(),
-        "ROP": grouped["ROP"].tolist(),
-        "Inventory": grouped["Inventory"].tolist(),
-        "Gap": grouped["Gap"].tolist(),
+        "Branch": cells["BranchName"].tolist(),
+        "Category": cells["Category"].tolist(),
+        "Value": cells["Value"].tolist(),
+        **{c: cells[c].tolist() for c in ["AvgCoverage", "CoveredShare", "FillRate", "EligibleRows", "CoveredRows", "SKUCount", "ROP", "Filled", "Gap"]},
+        "Line": ["#111827" if t else "#FFFFFF" for t in is_total],
+        "LineWidth": [1.2 if t else 0.5 for t in is_total],
+    }
+    totals = cells[is_total]
+    coverage_total_text.data = {
+        "Branch": totals["BranchName"].tolist(),
+        "Category": totals["Category"].tolist(),
+        "Text": [f"{v:.0%}" for v in totals["Value"]],
     }
     order = db.filter_options()["categories"]
-    present = set(grouped["Category"])
-    coverage_plot.x_range.factors = [c for c in order if c in present] + sorted(present - set(order))
-    coverage_plot.y_range.factors = grouped.groupby("BranchName")["ROP"].sum().sort_values(ascending=True).index.tolist()
+    present = set(cells["Category"]) - {TOTAL}
+    coverage_plot.x_range.factors = [c for c in order if c in present] + sorted(present - set(order)) + ([TOTAL] if len(cells) else [])
+    branch_rop = cells[(cells["Category"] == TOTAL) & (cells["BranchName"] != TOTAL)].sort_values("ROP")
+    coverage_plot.y_range.factors = branch_rop["BranchName"].tolist() + ([TOTAL] if len(cells) else [])
+    coverage_plot.height = max(360, 16 * len(coverage_plot.y_range.factors) + 140)
+    coverage_empty.visible = cells.empty
+
+
+def update_coverage_bars(groups: pd.DataFrame, level: str, metric: str, total) -> None:
+    bars = groups[groups["EligibleRows"] > 0].copy()
+    bars["Value"] = bars[metric]
+    bars = bars.sort_values([metric, "ROP"], ascending=[True, False])
+    if level == "sku":
+        bars = bars.head(40)
+        labels = MetricsCalculator.unique_bar_labels([str(n)[:50] for n in bars["SKU_Name"]], [str(i) for i in bars["SKU_ID"]])
+        title = "Хангалт хамгийн муу 40 SKU (бүх салбарын нийт; ижил бол ROP ихийг эхэнд)"
+    else:
+        column_name = "BranchName" if level == "branch" else "Category"
+        labels = bars[column_name].astype(str).tolist()
+        title = "Хангалт — салбараар (муу нь дээрээ)" if level == "branch" else "Хангалт — категориор (муу нь дээрээ)"
+    coverage_bar_source.data = {
+        "Label": labels,
+        "Value": bars["Value"].tolist(),
+        "ValueText": [_pct_text(v) for v in bars["Value"]],
+        **{c: bars[c].tolist() for c in ["AvgCoverage", "CoveredShare", "FillRate", "EligibleRows", "CoveredRows", "SKUCount", "BranchCount", "ROP", "Filled", "Gap"]},
+    }
+    coverage_bar_plot.y_range.factors = labels[::-1]
+    coverage_bar_plot.height = max(260, 22 * len(labels) + 110)
+    coverage_bar_plot.title.text = f"{title} · {COVERAGE_SHORT[metric]}"
+    if total is not None:
+        coverage_total_span.location = float(total[metric])
+        coverage_total_label.x = float(total[metric])
+        coverage_total_label.text = f"НИЙТ {total[metric]:.1%}"
+    coverage_total_span.visible = coverage_total_label.visible = total is not None
+    coverage_bar_empty.visible = bars.empty
 
 
 def update_quality() -> None:
@@ -572,10 +1212,6 @@ def update_quality() -> None:
         "Color": [m[3] for m in metrics],
     }
     quality_plot.x_range.factors = [m[0] for m in metrics]
-
-
-def update_table(f: Filters) -> None:
-    table_source.data = ColumnDataSource.from_df(db.table(f))
 
 
 def update_review_table() -> None:
@@ -663,9 +1299,10 @@ def refresh_all() -> None:
     update_status_chart(f)
     update_ved_chart(f)
     update_top_chart(f)
-    update_scatter(f)
-    update_table(f)
+    update_sku_tab(f)
     update_coverage(f)
+    update_class_tab(f)
+    update_expiry(f)
     update_quality()
     update_review_table()
     update_freshness()
@@ -673,7 +1310,7 @@ def refresh_all() -> None:
 
 
 def reset_branch_filter() -> None:
-    branch_filter.options = ["ALL"] + db.filter_options()["branches"]
+    branch_filter.options = ["ALL"] + branch_options()
     branch_filter.value = "ALL"
     min_gap_slider.end = max(1000, db.max_gap())
 
@@ -730,6 +1367,15 @@ def friendly_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {msg}"
 
 
+def update_batches(inventory: pd.DataFrame, snapshot_date: str) -> None:
+    """Rebuild fact_batch_expiry (Хугацаат tab) from uploaded inventory rows."""
+    batches = build_batch_expiry(inventory, dim_sku, fact_branch_rop, snapshot_date, ExpiryConfig.load())
+    db.replace_table("fact_batch_expiry", batches)
+    dated = inventory["ExpiryDate"].notna() if "ExpiryDate" in inventory else pd.Series(False, index=inventory.index)
+    metadata["expiry"] = {"snapshot_date": snapshot_date, "has_expiry_dates": bool(dated.any()),
+                          "expiry_completeness": float(dated.mean()) if len(dated) else 0.0}
+
+
 def upload_callback(attr: str, old: str, new: str) -> None:
     if not new:
         return
@@ -739,17 +1385,23 @@ def upload_callback(attr: str, old: str, new: str) -> None:
         inventory["SnapshotDate"] = pd.to_datetime(inventory["SnapshotDate"], errors="coerce").fillna(pd.Timestamp(snapshot_picker.value))
         inventory["SourceFile"] = upload.filename
         mapped, review, stats = map_inventory(inventory, alias_mapping, dim_sku, dim_branch)
+        update_batches(mapped, str(snapshot_picker.value))
         rebuild_from_inventory(mapped, upload.filename, review, stats)
         save_snapshot_files(mapped, state["status_wide"], review, snapshot_picker.value)
         save_upload_to_history(str(snapshot_picker.value))
         update_trend(current_filters())
+        state["uploaded"] = True  # live refresh must not replace what was uploaded
         message.text = f"<span style='color:#0F766E;font-weight:700;'>Амжилттай:</span> {upload.filename} | {stats['matched_rows']:,}/{stats['inventory_rows']:,} мөр таарсан ({stats['mapping_rate_rows']:.1%}) | Scope: {stats['scope']}"
     except Exception as exc:
         message.text = f"<span style='color:#B91C1C;font-weight:700;'>Алдаа:</span> {friendly_error(exc)}"
 
 
 def reset_callback() -> None:
+    state["uploaded"] = False
     db.replace_table("fact_sku_status", initial_status)
+    if initial_batches is not None:
+        db.replace_table("fact_batch_expiry", initial_batches)
+    metadata["expiry"] = initial_expiry_meta
     state["inventory"] = initial_inventory
     state["status_wide"] = None
     state["mapping_review"] = initial_mapping_review.copy()
@@ -764,7 +1416,10 @@ def clear_filters_callback() -> None:
     status_filter.value = []
     ved_filter.value = []
     category_filter.value = []
-    confidence_filter.value = []
+    abc_filter.value = []
+    xyz_filter.value = []
+    expiry_status.value = []
+    sku_band.value = ""
     branch_filter.value = "ALL"
     search_input.value = ""
     min_gap_slider.value = 0
@@ -920,8 +1575,52 @@ table_source.selected.on_change("indices", table_selected_callback)
 trend_include_network.on_change("active", trend_callback)
 movement_from.on_change("value", movement_callback)
 movement_to.on_change("value", movement_callback)
-for widget in [status_filter, ved_filter, category_filter, confidence_filter, branch_filter, search_input, min_gap_slider]:
+for widget in [status_filter, ved_filter, category_filter, branch_filter, search_input, min_gap_slider]:
     widget.on_change("value", filter_callback)
+
+def status_tap_callback(attr: str, old, new) -> None:
+    """Click a status bar to filter to it; click it again to clear."""
+    if not new:
+        return
+    status = status_source.data["Status"][new[0]]
+    status_source.selected.indices = []
+    if status not in STATUS_CHOICES:
+        return
+    status_filter.value = [] if status_filter.value == [status] else [status]
+
+
+def heatmap_tap_callback(source: ColumnDataSource, class_filter: MultiChoice):
+    """Click a class x Status cell to filter to that class and status; click
+    it again to clear both."""
+    def callback(attr: str, old, new) -> None:
+        if not new:
+            return
+        cls, status = source.data["Class"][new[0]], source.data["Status"][new[0]]
+        source.selected.indices = []
+        if status not in STATUS_CHOICES:
+            return
+        again = class_filter.value == [cls] and status_filter.value == [status]
+        class_filter.value = [] if again else [cls]
+        status_filter.value = [] if again else [status]
+    return callback
+
+
+status_source.selected.on_change("indices", status_tap_callback)
+ved_source.selected.on_change("indices", heatmap_tap_callback(ved_source, ved_filter))
+abc_source.selected.on_change("indices", heatmap_tap_callback(abc_source, abc_filter))
+xyz_source.selected.on_change("indices", heatmap_tap_callback(xyz_source, xyz_filter))
+for widget in [abc_filter, xyz_filter]:
+    widget.on_change("value", lambda attr, old, new: update_class_tab(current_filters()))
+class_order.on_change("active", lambda attr, old, new: update_class_tab(current_filters()))
+sku_band.on_change("value", lambda attr, old, new: update_sku_tab(current_filters()))
+band_source.selected.on_change("indices", band_tap_callback)
+for widget in [expiry_branch, expiry_status]:
+    widget.on_change("value", lambda attr, old, new: update_expiry(current_filters()))
+expiry_branch_source.selected.on_change("indices", expiry_branch_tap_callback)
+top_mode.on_change("active", lambda attr, old, new: update_top_chart(current_filters()))
+top_level.on_change("active", lambda attr, old, new: update_top_chart(current_filters()))
+coverage_level.on_change("active", lambda attr, old, new: update_coverage(current_filters()))
+coverage_metric.on_change("value", lambda attr, old, new: update_coverage(current_filters()))
 
 # Browser-side CSV export from the currently filtered table source.
 CSV_EXPORT_JS = """
@@ -946,7 +1645,13 @@ URL.revokeObjectURL(link.href);
 download_button = Button(label="Шүүсэн хүснэгт CSV", button_type="success", width=180)
 download_button.js_on_click(CustomJS(args=dict(source=table_source, filename="rop_filtered.csv"), code=CSV_EXPORT_JS))
 movement_download = Button(label="Өөрчлөлтийн хүснэгт CSV", button_type="success", width=200)
+coverage_download = Button(label="Хангалтын хүснэгт CSV", button_type="success", width=190)
+coverage_download.js_on_click(CustomJS(args=dict(source=coverage_table_source, filename="rop_coverage.csv"), code=CSV_EXPORT_JS))
 movement_download.js_on_click(CustomJS(args=dict(source=movement_source, filename="rop_status_movement.csv"), code=CSV_EXPORT_JS))
+expiry_download = Button(label="Хугацаат хүснэгт CSV", button_type="success", width=190)
+expiry_download.js_on_click(CustomJS(args=dict(source=expiry_items_source, filename="rop_expiry_batches.csv"), code=CSV_EXPORT_JS))
+class_download = Button(label="ABC / XYZ хүснэгт CSV", button_type="success", width=190)
+class_download.js_on_click(CustomJS(args=dict(source=class_items_source, filename="rop_abc_xyz.csv"), code=CSV_EXPORT_JS))
 
 controls = column(
     Div(text="<b>Шинэ үлдэгдэл оруулах</b><br><span style='font-size:11px;color:#6B7280;'>XLSX / XLSB / CSV; сүлжээний болон салбарын формат танина.</span>"),
@@ -958,38 +1663,126 @@ controls = column(
     message,
     sizing_mode="stretch_width",
 )
-filters = row(status_filter, ved_filter, category_filter, confidence_filter, branch_filter, search_input, min_gap_slider, sizing_mode="stretch_width")
+filters = row(status_filter, ved_filter, category_filter, branch_filter, search_input, min_gap_slider, sizing_mode="stretch_width")
+
+def section_title(text: str) -> Div:
+    return Div(text=f"<div style='margin:6px 0 2px 0;padding-top:14px;border-top:1px solid #E5E7EB;font-size:15px;font-weight:700;color:#12263A;'>{text}</div>", sizing_mode="stretch_width")
+
 
 executive_panel = TabPanel(
     title="Удирдлагын тойм",
     child=column(
         kpi_container,
-        Div(text="<div style='margin:6px 0 2px 0;padding-top:14px;border-top:1px solid #E5E7EB;font-size:15px;font-weight:700;color:#12263A;'>Эрсдэлийн тойм</div>", sizing_mode="stretch_width"),
-        gridplot([[status_plot, ved_plot]], sizing_mode="stretch_width"),
+        section_title("Эрсдэлийн тойм"),
+        Div(text="<span style='font-size:12px;color:#6B7280;'>Status баганан эсвэл VED × Status нүдэн дээр дарж шүүнэ (дахин дарвал цэвэрлэнэ). Саарал өнгө — өгөгдлийн чанарын status.</span>", sizing_mode="stretch_width"),
+        gridplot([[status_plot, ved_plot]], sizing_mode="stretch_width", toolbar_location=None),
+        section_title("TOP 20"),
+        row(Div(text="<span style='font-size:12px;color:#374151;'>Эрэмбэ:</span>", width=50), top_mode,
+            Div(text="<span style='font-size:12px;color:#374151;'>Түвшин:</span>", width=55), top_level),
         shortage_plot,
         sizing_mode="stretch_width",
     ),
 )
 analytics_panel = TabPanel(
     title="SKU анализ",
-    child=column(scatter_plot, detail_panel, main_table, sizing_mode="stretch_width"),
-)
-branch_panel = TabPanel(
-    title="Салбарын exposure",
-    child=column(branch_plot, Div(text="<i>Салбарын үлдэгдэлтэй файл upload хийвэл SKU-салбарын статус мөн шинэчлэгдэнэ.</i>"), sizing_mode="stretch_width"),
-)
-coverage_panel = TabPanel(
-    title="SKU coverage",
     child=column(
         Div(text=(
-            "<div style='padding:10px 0;color:#374151;'>"
-            "<b>SKU coverage</b> нь тухайн салбар × категори бүлэгт "
-            "Inventory Position ≥ ROP байгаа, ROP-той SKU-уудын хувийг харуулна. "
-            "Шүүлтүүрүүд болон шинэ inventory upload-д автоматаар шинэчлэгдэнэ."
+            "<div style='padding:10px 0;color:#374151;font-size:13px;line-height:1.5;'>"
+            "<b>SKU анализ</b> — SKU × салбарын мөр бүрийн үлдэгдлийг ROP-той нь харьцуулна: "
+            "<b style='color:#DC2626;'>улаан</b> — ROP-оос доош (нөхөх), <b style='color:#16A34A;'>ногоон</b> — хэвийн, "
+            "<b style='color:#1D4ED8;'>цэнхэр</b> — илүүдэл. Баганан дээр дарж доорх жагсаалтыг тухайн бүлгээр шүүнэ "
+            "(дахин дарвал цэвэрлэнэ). Дээрх шүүлтүүрүүд энд мөн үйлчилнэ."
             "</div>"
         ), sizing_mode="stretch_width"),
+        sku_kpis,
+        gridplot([[band_plot, ved_band_plot]], sizing_mode="stretch_width", toolbar_location=None),
+        table_title,
+        row(sku_band),
+        detail_panel,
+        main_table,
+        sizing_mode="stretch_width",
+    ),
+)
+branch_panel = TabPanel(
+    title="Салбарын VED ангилал бүтэц",
+    child=column(
+        Div(text=(
+            "<div style='padding:10px 0;color:#374151;font-size:13px;line-height:1.5;'>"
+            "<b>Салбарын VED ангилал бүтэц</b> — «Салбарын жагсаалт»-ын салбар бүрийн ROP-ийг VED ангиллаар (V, E, D) задлана; "
+            "салбарууд жагсаалтын дарааллаар. Хулганаа баганан дээр аваачиж хувийг харна."
+            "</div>"
+        ), sizing_mode="stretch_width"),
+        branch_plot,
+        sizing_mode="stretch_width",
+    ),
+)
+coverage_panel = TabPanel(
+    title="Барааны тархац",
+    child=column(
+        Div(text=(
+            "<div style='padding:10px 0;color:#374151;font-size:13px;line-height:1.5;'>"
+            "<b>Барааны тархац</b> — ROP-той SKU × салбарын мөр бүрийн үлдэгдэл ROP-оо хэр хангаж буйг харуулна "
+            "(үлдэгдлийн мэдээлэлгүй мөрийг 0 үлдэгдэлтэй гэж тооцно). "
+            "<b>НИЙТ</b> нь сонгосон шүүлтүүрийн бүх мөрийн нийлбэр; хүснэгтийн эхний мөр, дулааны зургийн НИЙТ мөр/багана. "
+            "Бүлэглэлт болон үзүүлэлтийг доороос сонгоно; дээрх шүүлтүүрүүд энд мөн үйлчилнэ."
+            "</div>"
+        ), sizing_mode="stretch_width"),
+        row(Div(text="<span style='font-size:12px;color:#374151;'>Бүлэглэлт:</span>", width=75), coverage_level,
+            coverage_metric, coverage_download),
+        coverage_kpis,
         coverage_plot,
+        coverage_bar_plot,
         coverage_table,
+        sizing_mode="stretch_width",
+    ),
+)
+class_panel = TabPanel(
+    title="ABC / XYZ",
+    child=column(
+        Div(text=(
+            "<div style='padding:10px 0;color:#374151;font-size:13px;line-height:1.5;'>"
+            "<b>ABC / XYZ</b> — SKU × салбарын мөрийг ROP файлын ангиллаар ABC ба XYZ-ээр тус тусад нь харуулна. "
+            "<b>ABC</b> — борлуулалтын дүнгээр: A нь борлуулалтын дийлэнхийг бүрдүүлдэг, C нь хамгийн бага. "
+            "<b>XYZ</b> — эрэлтийн тогтвортой байдлаар: X тогтвортой, Y хэлбэлзэлтэй, Z хамгийн тогтворгүй. "
+            "Нэг SKU салбар бүрт өөр ангилалтай байж болно; ROP файлд ангилалгүй мөрийг «ABC XYZ.xlsx»-ээс нөхнө (багана «Ангиллын эх»), аль алинд нь байхгүй бол «Тодорхойгүй».<br>"
+            "Нүдэн дээр дарж тухайн ангилал ба status-аар шүүнэ (дахин дарвал цэвэрлэнэ). "
+            "ABC ба XYZ шүүлтүүр зөвхөн энэ табад үйлчилнэ; дээрх шүүлтүүрүүд энд мөн үйлчилнэ."
+            "</div>"
+        ), sizing_mode="stretch_width"),
+        row(abc_filter, xyz_filter),
+        row(column(abc_plot, abc_summary, sizing_mode="stretch_width"),
+            column(xyz_plot, xyz_summary, sizing_mode="stretch_width"),
+            sizing_mode="stretch_width"),
+        section_title("SKU × салбарын жагсаалт"),
+        row(Div(text="<span style='font-size:12px;color:#374151;'>Эрэмбэ:</span>", width=55), class_order,
+            Div(text="<span style='font-size:12px;color:#6B7280;'>Эхний 2,000 мөр; ангилал дотроо хамгийн яаралтай нь эхэнд. "
+                     "Баганын гарчиг дээр дарж эрэмбэлнэ.</span>", width=520),
+            class_download),
+        class_items_table,
+        sizing_mode="stretch_width",
+    ),
+)
+expiry_panel = TabPanel(
+    title="Хугацаат",
+    child=column(
+        Div(text=(
+            "<div style='padding:10px 0;color:#374151;font-size:13px;line-height:1.5;'>"
+            "<b>Хугацаат</b> — хүчинтэй хугацаа нь дуусаагүй (өнөөдрөөс хойш) үлдэгдэлтэй бүх SKU-ийн багц. "
+            "Хугацааг үлдэгдлийн файлын «Сери.Хүртэл хүчинтэй», «Огноо», «Date», «Expiry Date» эсвэл «Хугацаа» баганаас уншина. "
+            "Салбарын хяналт «Салбарын жагсаалт»-ын дарааллаар; мөр дээр дарж тухайн салбарыг задална. "
+            "Бүлэг: хугацаа дуусахад үлдсэн хоногоор (expiry_config.json). "
+            "Дээрх VED, категори, хайлт энд мөн үйлчилнэ; ROP-ийн шүүлтүүр (status, салбар, gap) үйлчлэхгүй."
+            "</div>"
+        ), sizing_mode="stretch_width"),
+        row(expiry_branch, expiry_status, expiry_download),
+        expiry_note,
+        expiry_kpis,
+        expiry_month_plot,
+        section_title("Салбарын хяналт"),
+        expiry_branch_table,
+        expiry_branch_plot,
+        section_title("Багцын жагсаалт"),
+        expiry_items_table,
         sizing_mode="stretch_width",
     ),
 )
@@ -1025,11 +1818,117 @@ quality_panel = TabPanel(
     ),
 )
 method_panel = TabPanel(title="Аргачлал", child=methodology)
-tabs = Tabs(tabs=[executive_panel, analytics_panel, branch_panel, coverage_panel, trend_panel, quality_panel, method_panel], sizing_mode="stretch_width")
+# Each tab title as its own box; the open tab filled with the header colour.
+TAB_BOXES = InlineStyleSheet(css="""
+.bk-header { gap: 6px; padding: 4px 0 8px 0; border-bottom: none !important; flex-wrap: wrap; }
+.bk-tab {
+  background-color: #FFFFFF;
+  border: 1px solid #CBD5E1 !important;
+  border-radius: 8px !important;
+  padding: 7px 14px !important;
+  color: #1F2937;
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(18, 38, 58, 0.06);
+}
+.bk-tab:hover { background-color: #EEF4F7; border-color: #94A3B8 !important; }
+.bk-tab.bk-active { background-color: #1F4E5F; border-color: #1F4E5F !important; color: #FFFFFF; }
+""")
+tabs = Tabs(tabs=[executive_panel, analytics_panel, branch_panel, coverage_panel, class_panel, expiry_panel, trend_panel, quality_panel, method_panel],
+            sizing_mode="stretch_width", stylesheets=[TAB_BOXES])
 
+# --------------------------------------------------------------------------
+# Live refresh: every minute, reload when the ETL (Dagster, update_rop.py,
+# refresh_inventory.py) has rewritten the warehouse or the branch list changed.
+# Filters and the open tab stay as they are.
+# --------------------------------------------------------------------------
+LIVE_CHECK_SECONDS = 60
+SETTLE_SECONDS = 20  # an ETL run writes several files; wait until it is done
+
+
+def data_signature() -> int:
+    """Newest modification time among the warehouse files and the branch list."""
+    paths = [*DATA_DIR.glob("*.parquet"), DATA_DIR / "metadata.json", BRANCH_LIST_PATH]
+    return max((p.stat().st_mtime_ns for p in paths if p.exists()), default=0)
+
+
+def _live_text(prefix: str) -> str:
+    return f"● {prefix} {datetime.now():%H:%M} · {LIVE_CHECK_SECONDS} сек тутам шалгана"
+
+
+def reload_data() -> None:
+    """Re-read every warehouse table and redraw every tab."""
+    global metadata, dim_sku, dim_branch, fact_branch_rop, alias_mapping, initial_status, initial_inventory
+    global initial_mapping_review, initial_batches, initial_expiry_meta, TRACKED, TRACKED_NAMES
+    db.replace_connection(connect(DATA_DIR))
+    metadata = json.loads((DATA_DIR / "metadata.json").read_text(encoding="utf-8"))
+    dim_sku, dim_branch = db.table_frame("dim_sku"), db.table_frame("dim_branch")
+    fact_branch_rop, alias_mapping = db.table_frame("fact_branch_rop"), db.table_frame("alias_mapping")
+    initial_status, initial_inventory = db.table_frame("fact_sku_status"), db.table_frame("fact_inventory_snapshot")
+    initial_mapping_review = db.table_frame("mapping_review")
+    initial_batches = db.table_frame("fact_batch_expiry") if "fact_batch_expiry" in db.tables() else None
+    initial_expiry_meta = metadata.get("expiry")
+    TRACKED = tracked_branches()
+    TRACKED_NAMES = tuple(dict.fromkeys(data for _, data in TRACKED if data))
+    db.set_active_branches(TRACKED_NAMES)
+    state.update(inventory=initial_inventory, status_wide=None, mapping_review=initial_mapping_review.copy(),
+                 source_file=metadata.get("source_files", {}).get("inventory", "Initial snapshot"),
+                 mapping_stats=metadata.get("mapping", {}))
+    snapshot_picker.value = metadata.get("snapshot_date", snapshot_picker.value)
+
+    # keep each filter's selection where it still exists
+    categories = db.filter_options()["categories"]
+    category_filter.options = categories
+    category_filter.value = [c for c in category_filter.value if c in categories]
+    branch = branch_filter.value
+    branch_filter.options = ["ALL"] + branch_options()
+    branch_filter.value = branch if branch in branch_filter.options else "ALL"
+    expiry_branch.options = expiry_branch_options()
+    if expiry_branch.value not in {v for v, _ in expiry_branch.options}:
+        expiry_branch.value = EXPIRY_LIST
+    min_gap_slider.end = max(1000, db.max_gap())
+
+    update_branch_chart()
+    update_movement_options()
+    refresh_all()
+
+
+def check_for_new_data() -> None:
+    signature = data_signature()
+    if signature <= state["loaded_signature"] or time.time() - signature / 1e9 < SETTLE_SECONDS:
+        return
+    if state.get("uploaded"):
+        state["live_text"] = "● Шинэ өгөгдөл ирсэн — «Эхний snapshot сэргээх» дарж ачаална"
+        update_freshness()
+        return
+    try:
+        reload_data()
+    except Exception as exc:  # an ETL run still writing, or a failed run; try again next minute
+        state["live_text"] = f"● Шинэчлэл хойшлов ({type(exc).__name__}) — дараагийн шалгалтаар дахин оролдоно"
+        update_freshness()
+        return
+    state["loaded_signature"] = signature
+    state["live_text"] = _live_text("Шинэчлэгдлээ")
+    update_freshness()
+    message.text = f"<span style='color:#0F766E;font-weight:700;'>Өгөгдөл автоматаар шинэчлэгдлээ</span> ({datetime.now():%H:%M})"
+
+
+state["loaded_signature"] = data_signature()
+state["live_text"] = _live_text("Ачаалсан")
 update_branch_chart()
 update_movement_options()
 refresh_all()
+curdoc().add_periodic_callback(check_for_new_data, LIVE_CHECK_SECONDS * 1000)
 
-curdoc().add_root(column(header, freshness_banner, controls, filters, tabs, sizing_mode="stretch_width"))
+PAGE_BACKGROUND = GlobalInlineStyleSheet(css="""
+body {
+  background-color: #EEF2F5;
+  background-image:
+    radial-gradient(circle at 1px 1px, rgba(18, 38, 58, 0.07) 1px, transparent 0),
+    linear-gradient(180deg, #F6F8FA 0%, #E9EEF2 100%);
+  background-size: 22px 22px, 100% 100%;
+  background-attachment: fixed;
+}
+""")
+curdoc().add_root(column(header, freshness_banner, controls, filters, tabs, sizing_mode="stretch_width",
+                         stylesheets=[PAGE_BACKGROUND], styles={"padding": "8px 14px"}))
 curdoc().title = "ROP Advanced Dashboard"

@@ -1,0 +1,13 @@
+{
+  "_comment": "Expiry thresholds in days, read by expiry.py. Keys starting with _ are ignored.",
+  "critical_days": 30,
+  "warning_days": 90,
+  "watch_days": 180,
+  "_min_dispense_days": "Stock with less life left than this comes off the dispensing shelf. Override per category (dim_sku.Category) or per SKU_ID below.",
+  "min_dispense_days": 30,
+  "min_dispense_days_by_category": {},
+  "min_dispense_days_by_sku": {},
+  "_max_years_ahead": "An expiry date further ahead than this is treated as a data error (unknown expiry).",
+  "max_years_ahead": 10,
+  "days_per_month": 30.4
+}

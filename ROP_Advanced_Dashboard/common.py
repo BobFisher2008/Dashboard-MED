@@ -6,6 +6,7 @@ import json
 import math
 import re
 import tempfile
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,7 +23,14 @@ STATUS_ORDER = [
     "Илүүдэл",
 ]
 
+RISK_STATUSES = ("Тасарсан", "ROP-оос доош")
+
 VED_ORDER = ["V", "E", "D", "Тодорхойгүй"]
+VED_CLASSES = ("V", "E", "D")  # most critical first
+# dim_sku.VED_Source: where a SKU's VED comes from. SKUs listed in the VED file
+# carry that VED into every fact; the rest keep the ROP workbook's value.
+VED_FILE_SOURCE = "VED ангилал"
+VED_MASTER_SOURCE = "ROP мастер"
 VED_Z = {"V": 2.326, "E": 1.751, "D": 1.175}
 VED_WEIGHT = {"V": 3.0, "E": 2.0, "D": 1.0, "Тодорхойгүй": 1.0}
 STATUS_WEIGHT = {
@@ -40,11 +48,17 @@ NAME_ALIASES = {
     "branch": ["салбар", "агуулах", "location", "branch", "branchname", "store", "warehouse"],
     "manufacturer": ["үйлдвэрлэгч", "manufacturer"],
     "supplier": ["нийлүүлэгч", "поставщик", "supplier", "vendor"],
-    "on_hand": ["үлдэгдэл", "эцсийн үлдэгдэл", "on hand", "on_hand", "onhand", "closing stock", "closingstock", "quantity", "qty", "тоо"],
+    "on_hand": ["үлдэгдэл", "эцсийн үлдэгдэл", "on hand", "on_hand", "onhand", "closing stock", "closingstock", "quantity", "qty", "тоо","Total","total"],
     "on_order": ["замд", "захиалсан", "on order", "on_order", "onorder", "open po", "openpo"],
     "backorder": ["backorder", "back order", "дутагдал", "хүлээгдэж буй"],
     "snapshot_date": ["огноо", "snapshot date", "snapshot_date", "snapshotdate", "date"],
+    # Batch expiry ("Сери.Хүртэл хүчинтэй" = series valid until), most specific
+    # first: _find_expiry_column takes the first alias that some column has.
+    # The generic words (EXPIRY_GENERIC_ALIASES) only match a whole header.
+    "expiry": ["сери.хүртэл хүчинтэй", "хүртэл хүчинтэй", "expiry date", "expiration date", "exp date", "expiry",
+               "хүчинтэй хугацаа", "дуусах хугацаа", "дуусах огноо", "хугацаа", "огноо", "date"],
 }
+EXPIRY_GENERIC_ALIASES = {"хугацаа", "огноо", "date"}
 
 
 def normalize_product_name(value: Any) -> str:
@@ -90,6 +104,18 @@ def clean_category(value: Any) -> str:
     return text
 
 
+# Cyrillic letters typed for V / E / D on a Mongolian keyboard.
+_VED_LOOKALIKES = str.maketrans({"В": "V", "Е": "E", "Д": "D"})
+
+
+def clean_ved(value: Any) -> str | None:
+    """'V', 'E' or 'D'; None when the value is not a VED class."""
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip().upper().translate(_VED_LOOKALIKES)
+    return text if text in VED_CLASSES else None
+
+
 def is_excluded_branch(value: Any) -> bool:
     return normalize_product_name(value) in EXCLUDED_BRANCH_KEYS
 
@@ -128,6 +154,27 @@ def _find_column(columns: Iterable[Any], key: str) -> Any | None:
     for col in columns:
         if _matches_alias(col, aliases):
             return col
+    return None
+
+
+def _find_expiry_column(columns: Iterable[Any]) -> Any | None:
+    """The expiry column: the first alias, in NAME_ALIASES order, that a
+    header equals; then the specific aliases inside a compact header. So an
+    export with both «Сери.Хүртэл хүчинтэй» and «Огноо» takes the former, and
+    «Үлдэгдлийн огноо» is never read as an expiry date."""
+    columns = list(columns)
+    aliases = NAME_ALIASES["expiry"]
+    for alias in aliases:
+        alias_norm = normalize_header(alias)
+        for col in columns:
+            if normalize_header(col) == alias_norm or alias_norm in [normalize_header(p) for p in str(col).split("|")]:
+                return col
+    for alias in aliases:
+        if alias in EXPIRY_GENERIC_ALIASES:
+            continue
+        for col in columns:
+            if _matches_alias(col, [alias]):
+                return col
     return None
 
 
@@ -200,6 +247,63 @@ def _read_excel_raw(source: str | Path | bytes, filename: str | None = None) -> 
     raise ValueError("Тохирох үлдэгдлийн хүснэгт олдсонгүй.")
 
 
+_EXCEL_EPOCH = pd.Timestamp("1899-12-30")
+_YMD = re.compile(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})")
+_DMY = re.compile(r"(\d{1,2})([-./])(\d{1,2})\2(\d{4}|\d{2})")
+_MONTH_YEAR = re.compile(r"(\d{1,2})[-./](\d{4})")
+_YEAR_MONTH = re.compile(r"(\d{4})[-./](\d{1,2})")
+
+
+def _safe_date(year: int, month: int, day: int | None = None) -> pd.Timestamp | None:
+    """The date, or the last day of the month when ``day`` is None."""
+    try:
+        if day is None:
+            return pd.Timestamp(year, month, 1) + pd.offsets.MonthEnd(0)
+        return pd.Timestamp(year, month, day)
+    except ValueError:
+        return None
+
+
+def _parse_expiry(value: Any, month_first: bool) -> pd.Timestamp | None:
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    if isinstance(value, (date, np.datetime64)):
+        return pd.Timestamp(value).normalize()
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        # Excel serial day (xlsb cells arrive as plain numbers); 20000..80000 = 1954..2119.
+        return pd.to_datetime(int(value), unit="D", origin=_EXCEL_EPOCH) if 20000 <= value <= 80000 else None
+    text = str(value).strip().split(" ")[0].split("T")[0]
+    if text.isdigit() and len(text) == 5:
+        return _parse_expiry(int(text), month_first)
+    if m := _YMD.fullmatch(text):
+        return _safe_date(int(m[1]), int(m[2]), int(m[3]))
+    if m := _DMY.fullmatch(text):
+        first, sep, second, year = int(m[1]), m[2], int(m[3]), int(m[4])
+        year += 2000 if year < 100 else 0
+        month, day = (first, second) if sep == "/" and month_first else (second, first)
+        return _safe_date(year, month, day)
+    if m := _MONTH_YEAR.fullmatch(text):
+        return _safe_date(int(m[2]), int(m[1]))
+    if m := _YEAR_MONTH.fullmatch(text):
+        return _safe_date(int(m[1]), int(m[2]))
+    return None
+
+
+def parse_expiry_dates(values: pd.Series) -> pd.Series:
+    """Expiry dates of an export column as datetime64 (NaT = blank or unreadable).
+
+    Accepts dates, Excel serial numbers and text: m/d/yyyy (the ERP export),
+    d/m/yyyy when some value can only be read that way, d.m.yyyy, yyyy-mm-dd,
+    and month-only mm/yyyy, which means the last day of that month (the
+    "EXP 11/2026" convention)."""
+    day_first = any(
+        (m := _DMY.fullmatch(v.strip().split(" ")[0])) and m[2] == "/" and int(m[1]) > 12
+        for v in pd.unique(values.dropna()) if isinstance(v, str)
+    )
+    parsed = _map_unique(values, lambda v: _parse_expiry(v, month_first=not day_first))
+    return pd.to_datetime(parsed, errors="coerce")
+
+
 def parse_inventory(source: str | Path | bytes, filename: str | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Parse a simple CSV/XLSX/XLSB inventory export into a standard schema."""
     source_name = filename or (Path(source).name if isinstance(source, (str, Path)) else "upload")
@@ -242,6 +346,9 @@ def parse_inventory(source: str | Path | bytes, filename: str | None = None) -> 
         key: _find_column(cols, key)
         for key in ["sku_id", "product_name", "branch", "manufacturer", "supplier", "on_hand", "on_order", "backorder", "snapshot_date"]
     }
+    col_map["expiry"] = _find_expiry_column(cols)
+    if col_map["expiry"] is not None and col_map["snapshot_date"] == col_map["expiry"]:
+        col_map["snapshot_date"] = None  # «Огноо» / «Дуусах огноо» is the expiry date, not the snapshot date
 
     if col_map["product_name"] is None and col_map["sku_id"] is None:
         raise ValueError("SKU ID эсвэл Нэр төрөл багана олдсонгүй.")
@@ -261,6 +368,15 @@ def parse_inventory(source: str | Path | bytes, filename: str | None = None) -> 
         out["SnapshotDate"] = pd.to_datetime(frame[col_map["snapshot_date"]], errors="coerce")
     else:
         out["SnapshotDate"] = pd.NaT
+    if col_map["expiry"] is not None:
+        raw_expiry = frame[col_map["expiry"]]
+        out["ExpiryDate"] = parse_expiry_dates(raw_expiry)
+        raw_text = raw_expiry.astype(str).str.strip()
+        unreadable = out["ExpiryDate"].isna() & raw_expiry.notna() & (raw_text != "")
+        out["ExpiryRaw"] = raw_text.where(unreadable, "")  # kept only where it could not be read
+    else:
+        out["ExpiryDate"] = pd.NaT
+        out["ExpiryRaw"] = ""
 
     out = out[out["OnHand"].notna()].copy()
     out = out[(out["InventoryName"].astype(str).str.lower() != "nan") | out["SKU_ID"].notna()].copy()
@@ -389,6 +505,23 @@ def excluded_mask(branches: pd.Series) -> pd.Series:
     return _map_unique(branches, is_excluded_branch).astype(bool)
 
 
+def ved_measures(ved: pd.Series, rop_gap: pd.Series, status: pd.Series, low_confidence: pd.Series) -> pd.DataFrame:
+    """The VED-dependent measures of status rows: WeightedGap (ROP gap x VED
+    weight), PriorityScore and IsCritical (an at-risk V or E row)."""
+    weight = ved.map(VED_WEIGHT).astype("float64").fillna(1.0)
+    weighted = rop_gap.fillna(0) * weight
+    return pd.DataFrame({
+        "WeightedGap": weighted,
+        "PriorityScore": (
+            status.map(STATUS_WEIGHT).astype("float64").fillna(0)
+            + weight * 10
+            + np.minimum(weighted, 10000) / 100
+            + np.where(low_confidence, 5, 0)
+        ),
+        "IsCritical": status.isin(RISK_STATUSES) & ved.isin(["V", "E"]),
+    }, index=ved.index)
+
+
 def _join_unique(frame: pd.DataFrame, keys: list[str], col: str, limit: int = 500) -> pd.DataFrame:
     """'; '-joined sorted distinct non-empty values of ``col`` per key."""
     vals = frame[keys + [col]].copy()
@@ -462,17 +595,13 @@ def build_status_snapshot(
     status["Status"] = classify_status_vectorized(
         status["InventoryPosition"], status["ROP"], status["OnHand"].notna(), excess_threshold
     )
-    status["WeightedGap"] = status["ROPGap"].fillna(0) * status["VED"].map(VED_WEIGHT).fillna(1.0)
-    status["PriorityScore"] = (
-        status["Status"].map(STATUS_WEIGHT).fillna(0)
-        + status["VED"].map(VED_WEIGHT).fillna(1.0) * 10
-        + np.minimum(status["WeightedGap"].fillna(0), 10000) / 100
-        + np.where(status["ROP_Confidence"] == "Бага", 5, 0)
+    low_confidence = status["ROP_Confidence"].eq("Бага").fillna(False).astype(bool)
+    status[["WeightedGap", "PriorityScore", "IsCritical"]] = ved_measures(
+        status["VED"], status["ROPGap"], status["Status"], low_confidence
     )
     status["SnapshotDate"] = snapshot_date
     status["Scope"] = scope
     status["BranchGroup"] = _map_unique(status["BranchName"], branch_group)
-    status["IsCritical"] = status["Status"].isin(["Тасарсан", "ROP-оос доош"]) & status["VED"].isin(["V", "E"])
     status["HasROP"] = status["ROP"].fillna(0) > 0
     status["HasInventory"] = status["OnHand"].notna()
     return status
@@ -489,8 +618,44 @@ def apply_missing_as_zero(status: pd.DataFrame) -> pd.DataFrame:
     status.loc[missing & (status["ROP"] <= 0), "Status"] = "ROP байхгүй"
     status.loc[missing, "DataMatch"] = "Missing treated as zero"
     status.loc[missing, "HasInventory"] = True
-    status["IsCritical"] = status["Status"].isin(["Тасарсан", "ROP-оос доош"]) & status["VED"].isin(["V", "E"])
+    status["IsCritical"] = status["Status"].isin(RISK_STATUSES) & status["VED"].isin(["V", "E"])
     return status
+
+
+def _read_source_csv(path: str | Path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        return pd.read_csv(path, encoding="cp1251")
+
+
+def _match_source_names(
+    src: pd.DataFrame,
+    dim_sku: pd.DataFrame,
+    alias_mapping: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Add NormalizedKey, SKU_ID and MatchType to rows with a SourceName.
+
+    Exact matches only: the normalized key against the SKU master key, then
+    against the alias mapping. No fuzzy matching - in these lists the near
+    misses are other pack sizes of the same product. A few SKUs share a key
+    (e.g. "Бумба N6" and "Бумба №6"), so one name can match several SKUs;
+    MatchType "Exact name" marks the SKU whose own name it is."""
+    src = src.copy()
+    src["NormalizedKey"] = src["SourceName"].map(normalize_product_name)
+    master = dim_sku[["MasterKey", "SKU_ID", "SKU_Name"]].dropna(subset=["MasterKey", "SKU_ID"]).astype({"MasterKey": str})
+    src = src.merge(master.rename(columns={"MasterKey": "NormalizedKey"}), on="NormalizedKey", how="left")
+    exact = src["SKU_Name"].astype(str).str.strip().eq(src["SourceName"]) & src["SKU_ID"].notna()
+    src["MatchType"] = np.select([exact, src["SKU_ID"].notna()], ["Exact name", "Master key"], "Unmatched")
+    src = src.drop(columns="SKU_Name")
+    if alias_mapping is not None and len(alias_mapping):
+        alias = alias_mapping.dropna(subset=["NormalizedKey", "SKU_ID"]).drop_duplicates("NormalizedKey")
+        alias_map = alias.set_index(alias["NormalizedKey"].astype(str))["SKU_ID"]
+        via_alias = src["SKU_ID"].isna() & src["NormalizedKey"].isin(alias_map.index)
+        src.loc[via_alias, "SKU_ID"] = src.loc[via_alias, "NormalizedKey"].map(alias_map)
+        src.loc[via_alias, "MatchType"] = "Alias"
+    src["SKU_ID"] = pd.to_numeric(src["SKU_ID"], errors="coerce").astype("Int64")
+    return src
 
 
 def load_category_map(
@@ -505,27 +670,13 @@ def load_category_map(
     category, the most frequent one wins and the conflict is reported.
     Returns (category by SKU_ID, review rows, stats).
     """
-    try:
-        raw = pd.read_csv(path, encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        raw = pd.read_csv(path, encoding="cp1251")
+    raw = _read_source_csv(path)
     src = pd.DataFrame({
         "SourceName": raw.iloc[:, 0].astype(str).str.strip(),
         "SourceCategory": raw.iloc[:, 1].map(clean_category),
     })
-    src["NormalizedKey"] = src["SourceName"].map(normalize_product_name)
     source_rows = len(src)
-
-    master = dim_sku[["MasterKey", "SKU_ID"]].dropna().astype({"MasterKey": str})
-    src = src.merge(master.rename(columns={"MasterKey": "NormalizedKey"}), on="NormalizedKey", how="left")
-    src["MatchType"] = np.where(src["SKU_ID"].notna(), "Master key", "Unmatched")
-    if alias_mapping is not None and len(alias_mapping):
-        alias = alias_mapping.dropna(subset=["NormalizedKey", "SKU_ID"]).drop_duplicates("NormalizedKey")
-        alias_map = alias.set_index(alias["NormalizedKey"].astype(str))["SKU_ID"]
-        via_alias = src["SKU_ID"].isna() & src["NormalizedKey"].isin(alias_map.index)
-        src.loc[via_alias, "SKU_ID"] = src.loc[via_alias, "NormalizedKey"].map(alias_map)
-        src.loc[via_alias, "MatchType"] = "Alias"
-    src["SKU_ID"] = pd.to_numeric(src["SKU_ID"], errors="coerce").astype("Int64")
+    src = _match_source_names(src, dim_sku, alias_mapping)
 
     matched = src[src["SKU_ID"].notna()]
     category = matched.groupby("SKU_ID")["SourceCategory"].agg(lambda x: x.value_counts().index[0])
@@ -556,6 +707,143 @@ def apply_category_map(dim_sku: pd.DataFrame, category_by_sku: pd.Series) -> pd.
     mapped = pd.to_numeric(dim_sku["SKU_ID"], errors="coerce").map(category_by_sku)
     dim_sku["Category"] = mapped.fillna(dim_sku["Category"]).map(clean_category)
     return dim_sku
+
+
+def load_ved_map(
+    path: str | Path,
+    dim_sku: pd.DataFrame,
+    alias_mapping: pd.DataFrame | None = None,
+) -> tuple[pd.Series, pd.DataFrame, dict[str, Any]]:
+    """Map the VED classification file (product name in the first column, a
+    column headed VED) onto SKU_IDs.
+
+    Names are matched like ``load_category_map``. When one SKU receives more
+    than one VED, the row with the SKU's own name wins, then a master-key
+    match over an alias, then the most critical (V > E > D); the conflict is
+    reported. Rows whose VED is not V / E / D are reported and not applied.
+    Returns (VED by SKU_ID, review rows, stats).
+    """
+    raw = _read_source_csv(path)
+    ved_col = next((c for c in raw.columns if normalize_header(c) == "ved"), None)
+    if ved_col is None:
+        raise ValueError("VED багана олдсонгүй.")
+    src = pd.DataFrame({
+        "SourceName": raw.iloc[:, 0].astype(str).str.strip(),
+        "SourceVED": raw[ved_col].fillna("").astype(str).str.strip(),
+        "VEDClass": raw[ved_col].map(clean_ved),
+    })
+    source_rows = len(src)
+    src = _match_source_names(src, dim_sku, alias_mapping)
+
+    valid = src["VEDClass"].notna()
+    matched = src[src["SKU_ID"].notna() & valid]
+    quality = matched["MatchType"].map({"Exact name": 0, "Master key": 1, "Alias": 2})
+    rank = matched["VEDClass"].map({v: i for i, v in enumerate(VED_CLASSES)})
+    best = matched.assign(Quality=quality, Rank=rank).sort_values(["SKU_ID", "Quality", "Rank"]).drop_duplicates("SKU_ID")
+    ved = best.set_index("SKU_ID")["VEDClass"]
+    ved.index = ved.index.astype("int64")
+    conflicts = matched.groupby("SKU_ID")["VEDClass"].nunique()
+    conflict_ids = set(conflicts[conflicts > 1].index)
+
+    unmatched = src[src["SKU_ID"].isna() & valid].assign(Issue="VED файлын нэр SKU-тэй таарсангүй")
+    invalid = src[~valid].assign(Issue="VED утга V / E / D биш — хэрэглээгүй")
+    conflict_rows = matched[matched["SKU_ID"].isin(conflict_ids)].assign(
+        Issue="Олон VED — SKU-ийн өөрийн нэртэйг, үгүй бол хамгийн чухлыг (V > E > D) сонгов")
+    uncovered = dim_sku.loc[~dim_sku["SKU_ID"].isin(ved.index), ["SKU_ID", "SKU_Name", "VED"]]
+    uncovered = uncovered.rename(columns={"SKU_Name": "SourceName", "VED": "SourceVED"})
+    uncovered = uncovered.assign(Issue="SKU VED файлд алга — одоогийн VED хэвээр")
+    review = pd.concat([unmatched, invalid, conflict_rows, uncovered], ignore_index=True)
+    review = review.rename(columns={"SourceVED": "VED"})[["Issue", "SourceName", "VED", "SKU_ID", "NormalizedKey", "MatchType"]]
+    stats = {
+        "source_rows": int(source_rows),
+        "matched_rows": int(src.loc[src["SKU_ID"].notna(), "SourceName"].nunique()),
+        "unmatched_rows": int(len(unmatched)),
+        "invalid_rows": int(len(invalid)),
+        "sku_covered": int(len(ved)),
+        "sku_uncovered": int(len(uncovered)),
+        "sku_conflicts": int(len(conflict_ids)),
+    }
+    return ved, review, stats
+
+
+def apply_ved_map(dim_sku: pd.DataFrame, ved_by_sku: pd.Series) -> pd.DataFrame:
+    """Give the SKUs listed in the VED file their VED and mark them in
+    VED_Source. SKUs the file does not list keep their VED and source."""
+    dim_sku = dim_sku.copy()
+    if "VED_Source" not in dim_sku:
+        dim_sku["VED_Source"] = VED_MASTER_SOURCE
+    mapped = pd.to_numeric(dim_sku["SKU_ID"], errors="coerce").map(ved_by_sku)
+    listed = mapped.notna()
+    dim_sku.loc[listed, "VED"] = mapped[listed]
+    dim_sku.loc[listed, "VED_Source"] = VED_FILE_SOURCE
+    return dim_sku
+
+
+def load_branch_list(path: str | Path) -> list[str]:
+    """Branch names of «Салбарын жагсаалт.txt», in file order.
+
+    The file is a quoted list ('АФ ... э/сан',); a file of plain lines, one
+    name per line, works too. Spaces inside a name are kept as written."""
+    text = Path(path).read_text(encoding="utf-8-sig")
+    names = re.findall(r"'([^']*)'", text) or text.splitlines()
+    names = [n.strip().strip(",").strip() for n in names]
+    return list(dict.fromkeys(n for n in names if n))
+
+
+# Cyrillic letters typed for the ABC / XYZ class letters.
+_CLASS_LOOKALIKES = str.maketrans({"А": "A", "В": "B", "С": "C", "Х": "X", "У": "Y"})
+
+
+def load_abc_xyz_file(
+    path: str | Path,
+    dim_sku: pd.DataFrame,
+    dim_branch: pd.DataFrame,
+    alias_mapping: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Branch ABC / XYZ classes of «ABC XYZ.xlsx»: product names down the
+    first column, one column per branch, cells like «AZ».
+
+    Names are matched like ``load_category_map``; branches on their name,
+    exactly or by normalized key. Returns (SKU_ID, Branch_ID, ABC, XYZ) with
+    one row per SKU x branch, and stats."""
+    raw = pd.read_excel(path, sheet_name=0, header=0)
+    name_col = raw.columns[0]
+    names = pd.DataFrame({"SourceName": raw[name_col].astype(str).str.strip().drop_duplicates()})
+    names = _match_source_names(names, dim_sku, alias_mapping)
+    names = names[names["SKU_ID"].notna()]
+
+    branch_ids = dict(zip(dim_branch["BranchName"].astype(str), dim_branch["Branch_ID"].astype(str)))
+    by_key = {normalize_product_name(b): i for b, i in branch_ids.items()}
+    columns = {c: branch_ids.get(str(c).strip()) or by_key.get(normalize_product_name(c)) for c in raw.columns[1:]}
+    unmatched_branches = sorted(str(c) for c, i in columns.items() if i is None and not is_excluded_branch(c))
+    columns = {c: i for c, i in columns.items() if i is not None and not is_excluded_branch(c)}
+
+    cells = raw[[name_col, *columns]].rename(columns={name_col: "SourceName", **columns})
+    cells["SourceName"] = cells["SourceName"].astype(str).str.strip()
+    cells = cells.melt(id_vars="SourceName", var_name="Branch_ID", value_name="Class").dropna(subset=["Class"])
+    cells["Class"] = cells["Class"].astype(str).str.strip().str.upper().str.translate(_CLASS_LOOKALIKES)
+    valid = cells["Class"].str.fullmatch(r"[ABC][XYZ]")
+    invalid_cells = int((~valid).sum())
+    cells = cells[valid].merge(names[["SourceName", "SKU_ID", "MatchType"]], on="SourceName")
+    # A SKU matched by its own name beats one matched through a shared key or alias.
+    cells["Quality"] = cells["MatchType"].map({"Exact name": 0, "Master key": 1, "Alias": 2})
+    cells = cells.sort_values(["SKU_ID", "Branch_ID", "Quality"]).drop_duplicates(["SKU_ID", "Branch_ID"])
+    table = pd.DataFrame({
+        "SKU_ID": cells["SKU_ID"].astype("int64"),
+        "Branch_ID": cells["Branch_ID"].astype(str),
+        "ABC": cells["Class"].str[0],
+        "XYZ": cells["Class"].str[1],
+    }).reset_index(drop=True)
+    stats = {
+        "source_file": Path(path).name,
+        "source_names": int(raw[name_col].notna().sum()),
+        "matched_names": int(names["SourceName"].nunique()),
+        "branches_matched": len(columns),
+        "branches_unmatched": unmatched_branches,
+        "invalid_cells": invalid_cells,
+        "rows": int(len(table)),
+    }
+    return table, stats
 
 
 def load_project_data(data_dir: str | Path) -> dict[str, pd.DataFrame]:

@@ -3,7 +3,7 @@
 Facts hold keys and measures only; descriptive attributes live in the
 dimensions and are joined back in by the query layer (queries.py).
 
-    python warehouse.py build [--categories "SKU category.csv"] [--powerbi]
+    python warehouse.py build [--categories "SKU category.csv"] [--ved "VED ангилал.csv"] [--powerbi]
     python warehouse.py history
     python warehouse.py check
 """
@@ -19,16 +19,21 @@ import numpy as np
 import pandas as pd
 
 from common import (
+    RISK_STATUSES,
     STATUS_ORDER,
+    VED_FILE_SOURCE,
     VED_ORDER,
     excluded_mask,
     apply_category_map,
+    apply_ved_map,
     branch_group,
     clean_category,
     is_excluded_branch,
     load_category_map,
     load_project_data,
+    load_ved_map,
     save_json,
+    ved_measures,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -36,8 +41,6 @@ DATA_DIR = BASE_DIR / "data"
 SNAPSHOT_DIR = BASE_DIR / "snapshots"
 POWERBI_DIR = BASE_DIR / "powerbi_data"
 DB_PATH = DATA_DIR / "warehouse.duckdb"
-
-RISK_STATUSES = ("Тасарсан", "ROP-оос доош")
 
 STATUS_FACT_COLUMNS = [
     # keys
@@ -51,7 +54,7 @@ STATUS_FACT_COLUMNS = [
 ]
 BRANCH_ROP_COLUMNS = [
     "SKU_ID", "Branch_ID", "ROP", "AvgMonthlyDemand_Branch", "DemandSD", "LeadTimeMean",
-    "LeadTimeSD", "Sales7M", "ABC", "XYZ", "ABC_XYZ", "Z_VED", "Z_ABCXYZ", "Z_Final", "VED", "HasROP",
+    "LeadTimeSD", "Sales7M", "ABC", "XYZ", "ABC_XYZ", "Z_VED", "Z_ABCXYZ", "Z_Final", "VED", "VED_ROP", "HasROP",
 ]
 FLOAT_COLUMNS = [
     "OnHand", "OnOrder", "Backorder", "InventoryPosition", "ROP", "ROPGap",
@@ -63,7 +66,8 @@ TEXT_COLUMNS = ["Status", "VED", "DataMatch", "Supplier", "Manufacturer", "Scope
 # Tables that make up the warehouse, in load order.
 TABLES = [
     "dim_sku", "dim_branch", "dim_date", "dim_status", "dim_ved", "dim_category",
-    "fact_branch_rop", "fact_sku_status", "fact_status_history", "fact_inventory_snapshot",
+    "fact_branch_rop", "fact_abc_xyz_file", "fact_sku_status", "fact_status_history", "fact_inventory_snapshot",
+    "dim_expiry_status", "fact_batch_expiry", "fact_batch_expiry_history",
     "alias_mapping", "mapping_review", "data_dictionary",
 ]
 
@@ -141,10 +145,61 @@ def to_fact_branch_rop(wide: pd.DataFrame) -> pd.DataFrame:
     df["SKU_ID"] = pd.to_numeric(df["SKU_ID"], errors="coerce").astype("int64")
     df["Branch_ID"] = df["Branch_ID"].astype(str)
     df["HasROP"] = _as_bool(df["HasROP"])
-    for col in ["ABC", "XYZ", "ABC_XYZ", "VED"]:
+    # The VED the workbook calculated Z_VED and ROP with; VED itself may later
+    # be replaced from the VED file (apply_sku_ved).
+    df["VED_ROP"] = df["VED_ROP"].fillna(df["VED"])
+    for col in ["ABC", "XYZ", "ABC_XYZ", "VED", "VED_ROP"]:
         df[col] = df[col].astype("string")
     df = _dedupe_keys(df, ["SKU_ID", "Branch_ID"])
     return df.reset_index(drop=True)
+
+
+def apply_sku_ved(fact: pd.DataFrame, dim_sku: pd.DataFrame) -> pd.DataFrame:
+    """Give the rows of every SKU listed in the VED file (dim_sku.VED_Source)
+    that SKU's VED.
+
+    Status facts also get their VED-dependent measures (WeightedGap,
+    PriorityScore, IsCritical) recomputed on the rows that changed. ROP and
+    Z_VED stay as the workbook calculated them; fact_branch_rop keeps the
+    workbook's VED in VED_ROP."""
+    if fact.empty or "VED_Source" not in dim_sku:
+        return fact
+    listed = dim_sku.loc[dim_sku["VED_Source"] == VED_FILE_SOURCE].set_index("SKU_ID")["VED"]
+    if listed.empty:
+        return fact
+    new = fact["SKU_ID"].map(listed).astype(object)
+    current = fact["VED"].astype(object).where(fact["VED"].notna(), None)
+    changed = (new.notna() & (new != current)).to_numpy(dtype=bool)
+    if not changed.any():
+        return fact
+    out = fact.copy()
+    out.loc[changed, "VED"] = new[changed]
+    if {"ROPGap", "Status", "WeightedGap", "PriorityScore", "IsCritical"}.issubset(out.columns):
+        rows = out.loc[changed]
+        confidence = dim_sku.set_index("SKU_ID")["ROP_Confidence"] if "ROP_Confidence" in dim_sku else pd.Series(dtype=object)
+        low_confidence = rows["SKU_ID"].map(confidence).eq("Бага").fillna(False).astype(bool)
+        measures = ved_measures(rows["VED"], rows["ROPGap"], rows["Status"], low_confidence)
+        for col in measures:
+            out.loc[changed, col] = measures[col]
+    return out
+
+
+def ved_differences(fact_branch_rop: pd.DataFrame, dim_sku: pd.DataFrame) -> pd.DataFrame:
+    """SKUs whose VED now differs from the VED the ROP workbook used (VED_ROP),
+    with the number of branch rows affected - the SKUs whose ROP the workbook
+    calculated with another VED."""
+    differs = fact_branch_rop["VED"].astype(object) != fact_branch_rop["VED_ROP"].astype(object)
+    diff = fact_branch_rop.loc[differs]
+    if diff.empty:
+        return pd.DataFrame(columns=["Issue", "SourceName", "VED", "PreviousVED", "SKU_ID", "Rows"])
+    out = diff.groupby("SKU_ID").agg(
+        VED=("VED", "first"),
+        PreviousVED=("VED_ROP", lambda s: s.mode().iloc[0]),
+        Rows=("VED", "size"),
+    ).reset_index()
+    out["SourceName"] = out["SKU_ID"].map(dim_sku.set_index("SKU_ID")["SKU_Name"])
+    out["Issue"] = "ROP файлын VED-ээс өөр — VED файлынхыг авав"
+    return out[["Issue", "SourceName", "VED", "PreviousVED", "SKU_ID", "Rows"]]
 
 
 def branch_rop_wide(fact_branch_rop: pd.DataFrame, dim_branch: pd.DataFrame, dim_sku: pd.DataFrame) -> pd.DataFrame:
@@ -216,16 +271,30 @@ def build_static_dims(dim_sku: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
 DATA_DICTIONARY = pd.DataFrame([
     ("dim_sku", "SKU_ID", "SKU master key; Category comes from 'SKU category.csv' where matched"),
+    ("dim_sku", "VED", "VED class; from 'VED ангилал.csv' where the SKU is listed (VED_Source = 'VED ангилал')"),
     ("dim_sku", "ROP_Used", "Network-level working ROP; corrected detail where available, fallback otherwise"),
     ("dim_branch", "Branch_ID", "Branch key; UNMAPPED::* for inventory branches missing from the ROP file"),
     ("dim_date", "DateKey", "yyyymmdd integer key; HasSnapshot marks dates with a status snapshot"),
     ("fact_branch_rop", "ROP", "Branch ROP (grain: SKU x branch)"),
+    ("fact_branch_rop", "VED_ROP", "VED the ROP workbook used for Z_VED and ROP; VED is the current class"),
+    ("fact_branch_rop", "ABC / XYZ", "Branch ABC (sales value) and XYZ (demand variability) class from the ROP workbook"),
+    ("fact_branch_rop", "AvgMonthlyDemand_Branch", "Average monthly sales; the dashboard leaves out SKU x branch rows where it is missing or 0"),
+    ("fact_abc_xyz_file", "ABC / XYZ", "Branch class from 'ABC XYZ.xlsx'; fills the ROP workbook's missing classes in the ABC / XYZ tab"),
     ("fact_sku_status", "InventoryPosition", "OnHand + OnOrder - Backorder (grain: SKU x branch x date)"),
     ("fact_sku_status", "ROPGap", "MAX(ROP - InventoryPosition, 0)"),
     ("fact_sku_status", "Status", "Stockout / below ROP / normal / excess / missing data / missing ROP"),
     ("fact_sku_status", "WeightedGap", "ROPGap weighted by VED criticality"),
     ("fact_sku_status", "PriorityScore", "Operational prioritization score"),
     ("fact_status_history", "*", "Same columns as fact_sku_status, one set of rows per snapshot DateKey"),
+    ("fact_batch_expiry", "ExpiryDateKey", "Batch expiry yyyymmdd from the export's expiry column; NULL = unknown (grain: SKU x branch x expiry x date)"),
+    ("fact_batch_expiry", "Qty", "Stock of the batch; SUM(Qty) per SKU x branch x date = fact_sku_status.OnHand"),
+    ("fact_batch_expiry", "DTE", "Days to expiry: ExpiryDate - snapshot date"),
+    ("fact_batch_expiry", "ExpiryStatus", "EXPIRED / CRITICAL / WARNING / WATCH / OK / UNKNOWN; thresholds in expiry_config.json"),
+    ("fact_batch_expiry", "PullFlag", "0 <= DTE < MinDispenseDays: off the dispensing shelf, not usable stock"),
+    ("fact_batch_expiry", "FEFORank", "Pick order of the usable batches of a SKU x branch; 1 = earliest expiry"),
+    ("fact_batch_expiry", "ProjectedWaste", "Qty demand will not use before DTE - MinDispenseDays (FEFO walk); NULL without a demand figure"),
+    ("fact_batch_expiry", "AtRisk", "ProjectedWaste > 0"),
+    ("fact_batch_expiry_history", "*", "Same columns as fact_batch_expiry, one set of rows per snapshot DateKey"),
 ], columns=["Table", "Field", "Definition"])
 
 
@@ -372,6 +441,37 @@ def save_snapshot_files(inventory: pd.DataFrame, status_wide: pd.DataFrame, revi
 # --------------------------------------------------------------------------
 # Integrity
 # --------------------------------------------------------------------------
+def _batch_expiry_checks(con: duckdb.DuckDBPyConnection, tables: set[str]) -> dict[str, Any]:
+    """fact_batch_expiry must describe the same snapshot as fact_sku_status,
+    and its batches must add up to each SKU x branch's OnHand."""
+    q = lambda sql: con.execute(sql).fetchone()[0]  # noqa: E731
+    c: dict[str, Any] = {}
+    c["fact_batch_expiry_rows"] = q("SELECT count(*) FROM fact_batch_expiry")
+    c["fact_batch_expiry_unique_key"] = q(
+        "SELECT count(*) = count(DISTINCT (SKU_ID, Branch_ID, ExpiryDateKey, DateKey)) FROM fact_batch_expiry")
+    c["fact_batch_expiry_orphan_sku"] = q("SELECT count(*) FROM fact_batch_expiry ANTI JOIN dim_sku USING (SKU_ID)")
+    c["fact_batch_expiry_orphan_branch"] = q("SELECT count(*) FROM fact_batch_expiry ANTI JOIN dim_branch USING (Branch_ID)")
+    c["fact_batch_expiry_excluded_branch_rows"] = q(
+        "SELECT count(*) FROM fact_batch_expiry JOIN dim_branch USING (Branch_ID) WHERE IsExcluded")
+    c["fact_batch_expiry_invalid_fefo"] = q(
+        "SELECT count(*) FROM fact_batch_expiry WHERE (FEFORank IS NOT NULL) <> IsUsable "
+        "OR ProjectedWaste < -1e-9 OR ProjectedWaste > Qty + 1e-9")
+    if "fact_sku_status" in tables:
+        batch_dates = [r[0] for r in con.execute("SELECT DISTINCT DateKey FROM fact_batch_expiry ORDER BY 1").fetchall()]
+        status_dates = [r[0] for r in con.execute("SELECT DISTINCT DateKey FROM fact_sku_status ORDER BY 1").fetchall()]
+        # A stale batch fact (built from an earlier snapshot) fails here;
+        # reconciling it row by row would only repeat that.
+        c["fact_batch_expiry_invalid_snapshot"] = int(batch_dates != status_dates)
+        if batch_dates == status_dates:
+            c["fact_batch_expiry_invalid_reconciliation"] = q("""
+                WITH b AS (SELECT SKU_ID, Branch_ID, DateKey, sum(Qty) AS qty FROM fact_batch_expiry GROUP BY ALL),
+                     s AS (SELECT SKU_ID, Branch_ID, DateKey, coalesce(OnHand, 0) AS qty FROM fact_sku_status)
+                SELECT count(*) FROM b FULL JOIN s USING (SKU_ID, Branch_ID, DateKey)
+                WHERE abs(coalesce(b.qty, 0) - coalesce(s.qty, 0)) > 1e-6 * greatest(1, abs(coalesce(s.qty, 0)))
+            """)
+    return c
+
+
 def integrity_checks(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
     q = lambda sql: con.execute(sql).fetchone()[0]  # noqa: E731
     tables = {r[0] for r in con.execute("SELECT table_name FROM information_schema.tables").fetchall()}
@@ -401,6 +501,21 @@ def integrity_checks(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
         c[f"{table}_negative_gap"] = q(f"SELECT count(*) FROM {table} WHERE ROPGap < 0")
         c[f"{table}_invalid_coverage"] = q(f"SELECT count(*) FROM {table} WHERE CoverageRatio < 0 OR CoverageRatio > 1")
         c[f"{table}_excluded_branch_rows"] = q(f"SELECT count(*) FROM {table} JOIN dim_branch USING (Branch_ID) WHERE IsExcluded")
+    # VED: a known class everywhere, and every SKU listed in the VED file
+    # carries that file's VED in each fact (one pipeline skipping
+    # apply_sku_ved would show up here).
+    known_ved = ", ".join(f"'{v}'" for v in VED_ORDER)
+    has_source = q("SELECT count(*) FROM information_schema.columns WHERE table_name = 'dim_sku' AND column_name = 'VED_Source'")
+    for table in ["fact_branch_rop", "fact_sku_status", "fact_status_history"]:
+        if table not in tables:
+            continue
+        listed = f" OR (s.VED_Source = '{VED_FILE_SOURCE}' AND f.VED IS DISTINCT FROM s.VED)" if has_source else ""
+        c[f"{table}_invalid_ved"] = q(
+            f"SELECT count(*) FROM {table} f LEFT JOIN dim_sku s USING (SKU_ID) "
+            f"WHERE f.VED IS NULL OR f.VED NOT IN ({known_ved}){listed}"
+        )
+    if "fact_batch_expiry" in tables:
+        c.update(_batch_expiry_checks(con, tables))
     if "fact_status_history" in tables:
         c["history_dates"] = [str(r[0]) for r in con.execute("SELECT DISTINCT DateKey FROM fact_status_history ORDER BY 1").fetchall()]
     c["negative_rop_rows"] = q("SELECT count(*) FROM fact_branch_rop WHERE ROP < 0")
@@ -420,7 +535,8 @@ def integrity_checks(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 # Build
 # --------------------------------------------------------------------------
-def build(categories: Path | None = None, powerbi: bool = False, data_dir: Path = DATA_DIR) -> dict[str, Any]:
+def build(categories: Path | None = None, powerbi: bool = False, data_dir: Path = DATA_DIR,
+          ved: Path | None = None) -> dict[str, Any]:
     frames = load_project_data(data_dir)
     metadata_path = data_dir / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
@@ -438,6 +554,12 @@ def build(categories: Path | None = None, powerbi: bool = False, data_dir: Path 
         dim_sku = apply_category_map(dim_sku, category_by_sku)
         review.to_csv(data_dir / "category_review.csv", index=False, encoding="utf-8-sig")
         metadata["categories"] = {"source_file": Path(categories).name, **cat_stats}
+    if ved is not None:
+        ved_by_sku, ved_review, ved_stats = load_ved_map(ved, dim_sku, alias)
+        before = dim_sku.set_index("SKU_ID")["VED"]
+        dim_sku = apply_ved_map(dim_sku, ved_by_sku)
+        ved_stats["dim_sku_changed"] = int((dim_sku.set_index("SKU_ID")["VED"] != before).sum())
+        metadata["ved"] = {"source_file": Path(ved).name, **ved_stats}
     for col in ["HasROP", "HasDetailROP"]:
         if col in dim_sku:
             dim_sku[col] = _as_bool(dim_sku[col])
@@ -448,9 +570,20 @@ def build(categories: Path | None = None, powerbi: bool = False, data_dir: Path 
     history, history_branches = read_snapshot_history()
     dim_branch = ensure_branches(frames["dim_branch"], raw_rop, raw_status, inventory, history_branches)
 
-    fact_branch_rop = to_fact_branch_rop(raw_rop)
-    fact_status = to_fact_status(raw_status, metadata.get("snapshot_date"))
-    history = upsert_history(history, fact_status)
+    # Snapshot files keep the VED of their day, so the VED file is applied
+    # again to every fact on every build.
+    fact_branch_rop = apply_sku_ved(to_fact_branch_rop(raw_rop), dim_sku)
+    fact_status = apply_sku_ved(to_fact_status(raw_status, metadata.get("snapshot_date")), dim_sku)
+    history = apply_sku_ved(upsert_history(history, fact_status), dim_sku)
+
+    if ved is not None:
+        differences = ved_differences(fact_branch_rop, dim_sku)
+        pd.concat([ved_review, differences], ignore_index=True).to_csv(
+            data_dir / "ved_review.csv", index=False, encoding="utf-8-sig")
+        metadata["ved"].update({
+            "sku_differs_from_rop_workbook": int(len(differences)),
+            "branch_rows_differ_from_rop_workbook": int(differences["Rows"].sum()) if len(differences) else 0,
+        })
 
     if len(inventory):
         inventory["SKU_ID"] = pd.to_numeric(inventory["SKU_ID"], errors="coerce").astype("Int64")
@@ -489,6 +622,7 @@ def rebuild_history(data_dir: Path = DATA_DIR) -> dict[str, Any]:
     frames = load_project_data(data_dir)
     history, pairs = read_snapshot_history()
     history = upsert_history(history, to_fact_status(frames["fact_sku_status"]))
+    history = apply_sku_ved(history, frames["dim_sku"])
     dim_branch = ensure_branches(frames["dim_branch"], pairs)
     date_keys = sorted(set(history["DateKey"].astype(int)))
     write_tables({"fact_status_history": history, "dim_branch": dim_branch, "dim_date": build_dim_date(date_keys)}, data_dir)
@@ -503,13 +637,14 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     b = sub.add_parser("build", help="Rebuild all Parquet tables and warehouse.duckdb")
     b.add_argument("--categories", type=Path, default=None, help="CSV: product name, category")
+    b.add_argument("--ved", type=Path, default=None, help="CSV: product name, ..., VED (V / E / D)")
     b.add_argument("--powerbi", action="store_true", help="Also export readable CSVs to powerbi_data/")
     sub.add_parser("history", help="Rebuild fact_status_history from snapshots/")
     sub.add_parser("check", help="Run integrity checks only")
     args = parser.parse_args()
 
     if args.command == "build":
-        checks = build(args.categories, args.powerbi)
+        checks = build(args.categories, args.powerbi, ved=args.ved)
     elif args.command == "history":
         checks = rebuild_history()
     else:

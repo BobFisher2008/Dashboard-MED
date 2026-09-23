@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from bokeh.util.hex import hexbin
 
 from common import STATUS_ORDER
+from queries import TOTAL
 from warehouse import RISK_STATUSES
 
 
@@ -14,34 +14,90 @@ class MetricsCalculator:
     def calculate_kpis(status: pd.DataFrame) -> dict[str, float]:
         """Reference pandas implementation of DashboardQuery.kpis."""
         if status.empty:
-            return {"sku_count": 0.0, "inventory_position": 0.0, "total_rop": 0.0, "rop_gap": 0.0, "critical": 0.0}
+            return {"sku_count": 0.0, "inventory_position": 0.0, "total_rop": 0.0, "rop_gap": 0.0, "critical": 0.0, "excess": 0.0}
+        above = (status["ROP"] > 0) & (status["InventoryPosition"] > status["ROP"])
         return {
             "sku_count": float(status["SKU_ID"].nunique()),
             "inventory_position": float(status["InventoryPosition"].sum(skipna=True)),
             "total_rop": float(status["ROP"].sum(skipna=True)),
             "rop_gap": float(status["ROPGap"].sum(skipna=True)),
             "critical": float(status["IsCritical"].fillna(False).astype(bool).sum()),
+            "excess": float((status["InventoryPosition"] - status["ROP"])[above].sum()),
         }
 
     @staticmethod
-    def finalize_coverage(grouped: pd.DataFrame) -> pd.DataFrame:
-        """Branch x category sums -> average coverage ratio and gap."""
-        out = grouped.copy()
-        out["Coverage"] = np.where(out["EligibleSKU"] > 0, out["CoverageRatio"] / out["EligibleSKU"].where(out["EligibleSKU"] > 0), np.nan)
-        out["Gap"] = (out["ROP"] - out["Inventory"]).clip(lower=0)
-        return out.sort_values(["BranchName", "Category"]).reset_index(drop=True)
+    def auto_top_measure(statuses: list[str] | tuple[str, ...], critical_only: bool = False) -> str:
+        """Which ranking fits the status filter: shortage ('gap') when an at-risk
+        status is in view, stock above ROP ('excess') for normal / excess stock,
+        plain stock ('stock') when only 'ROP байхгүй' rows are in view, and
+        ROP of rows without inventory ('missing') for 'Өгөгдөл алга'."""
+        selected = set(statuses) or set(STATUS_ORDER)
+        if critical_only or selected & set(RISK_STATUSES):
+            return "gap"
+        if selected & {"Илүүдэл", "Хэвийн"}:
+            return "excess"
+        if "ROP байхгүй" in selected:
+            return "stock"
+        if "Өгөгдөл алга" in selected:
+            return "missing"
+        return "gap"
 
     @staticmethod
-    def hexbin_log(rop: pd.Series, inventory: pd.Series, size: float) -> tuple[list, list, list]:
-        """Hex-bin SKUs on log10(x + 1) axes; returns (q, r, counts)."""
-        if len(rop) == 0:
-            return [], [], []
-        x = np.log10(pd.Series(rop).fillna(0).clip(lower=0).to_numpy() + 1)
-        y = np.log10(pd.Series(inventory).fillna(0).clip(lower=0).to_numpy() + 1)
-        bins = hexbin(x, y, size=size)
-        # Bokeh >=3.9 returns a dataclass (bins.q); older versions a DataFrame.
-        q, r, counts = (bins.q, bins.r, bins.counts) if hasattr(bins, "q") else (bins["q"], bins["r"], bins["counts"])
-        return list(q), list(r), list(counts)
+    def finalize_coverage(sums: pd.DataFrame) -> pd.DataFrame:
+        """Coverage sums (DashboardQuery.coverage_summary) -> ratios.
+
+        Only SKU x branch rows with ROP > 0 count; rows with no inventory
+        record count as zero stock.
+          AvgCoverage   mean of min(Inventory / ROP, 1)
+          CoveredShare  share of rows with Inventory >= ROP
+          FillRate      sum(min(Inventory, ROP)) / sum(ROP)  (ROP-weighted)
+          Gap           sum(ROP) - sum(min(Inventory, ROP))  (units short of ROP)
+        """
+        out = sums.copy()
+        eligible = out["EligibleRows"].where(out["EligibleRows"] > 0)
+        out["AvgCoverage"] = out["RatioSum"] / eligible
+        out["CoveredShare"] = out["CoveredRows"] / eligible
+        out["FillRate"] = out["Filled"] / out["ROP"].where(out["ROP"] > 0)
+        out["Gap"] = (out["ROP"] - out["Filled"]).clip(lower=0)
+        return out.reset_index(drop=True)
+
+    @staticmethod
+    def heatmap_cells(cells: pd.DataFrame) -> pd.DataFrame:
+        """Class x Status counts (Class, Status, Count) -> plus Share of the
+        class row and Intensity = count relative to the largest cell, for the
+        VED / ABC / XYZ x Status heatmaps."""
+        out = cells.copy()
+        row_total = out.groupby("Class")["Count"].transform("sum")
+        out["Share"] = (out["Count"] / row_total.where(row_total > 0)).fillna(0)
+        out["Intensity"] = out["Count"] / max(int(out["Count"].max()), 1) if len(out) else out["Count"]
+        return out
+
+    @staticmethod
+    def class_rollup(breakdown: pd.DataFrame, column: str, order: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """ABC x XYZ x Status sums (DashboardQuery.class_breakdown) rolled up
+        to one class column, 'ABC' or 'XYZ' -> (cells, classes).
+
+        cells    one row per class x status, ready for the heatmap (heatmap_cells)
+        classes  the grand total (Class = TOTAL) first, then the classes in ``order``:
+                 SalesShare   share of the 7-month sales of all rows shown
+                 CoveredShare rows with Inventory >= ROP / rows with ROP > 0
+                 RiskShare    at-risk rows / all rows of the class
+        """
+        measures = [c for c in breakdown.columns if c not in ("ABC", "XYZ", "Status")]
+        cells = breakdown.groupby([column, "Status"], as_index=False)[measures].sum()
+        cells = MetricsCalculator.heatmap_cells(cells.rename(columns={column: "Class", "Rows": "Count"}))
+        classes = breakdown.groupby(column, as_index=False)[measures].sum().rename(columns={column: "Class"})
+        position = {c: i for i, c in enumerate(order)}
+        classes = classes.assign(Order=classes["Class"].map(position).fillna(len(order)))
+        classes = classes.sort_values("Order", kind="stable").drop(columns="Order")
+        if len(classes):
+            total = classes[measures].sum().to_frame().T.assign(Class=TOTAL)
+            classes = pd.concat([total, classes], ignore_index=True)
+        total_sales = float(classes["Sales"].iloc[0]) if len(classes) else 0.0
+        classes["SalesShare"] = classes["Sales"] / total_sales if total_sales > 0 else np.nan
+        classes["CoveredShare"] = classes["CoveredRows"] / classes["EligibleRows"].where(classes["EligibleRows"] > 0)
+        classes["RiskShare"] = classes["RiskRows"] / classes["Rows"]
+        return cells, classes.reset_index(drop=True)
 
     @staticmethod
     def unique_bar_labels(names: list[str], hints: list[str]) -> list[str]:

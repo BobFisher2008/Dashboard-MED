@@ -7,3 +7,7 @@ rapidfuzz>=3.10
 duckdb>=1.1
 pyarrow>=15
 pytest>=8
+watchdog>=4
+# ETL orchestration (dagster_rop/): dagster dev -m dagster_rop.definitions
+dagster>=1.9
+dagster-webserver>=1.9

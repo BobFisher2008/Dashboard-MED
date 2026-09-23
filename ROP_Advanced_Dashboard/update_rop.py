@@ -3,22 +3,47 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
-from common import build_status_snapshot, excluded_mask, load_project_data, save_json
-from warehouse import DATA_DIR, branch_rop_wide, ensure_branches, status_tables, to_fact_branch_rop, write_tables
+from common import build_status_snapshot, excluded_mask, load_abc_xyz_file, load_project_data, save_json
+from warehouse import (
+    DATA_DIR,
+    apply_sku_ved,
+    branch_rop_wide,
+    ensure_branches,
+    status_tables,
+    to_fact_branch_rop,
+    write_tables,
+)
 
 BASE = Path(__file__).resolve().parent
 ROP_FILE = BASE / "ROP final.xlsb"
+ABC_XYZ_FILE = BASE / "ABC XYZ.xlsx"
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Load the final branch ROP workbook into the warehouse.")
-    parser.add_argument("--rop", type=Path, default=ROP_FILE)
-    parser.add_argument("--powerbi", action="store_true", help="Also export readable CSVs to powerbi_data/")
-    args = parser.parse_args()
+def load_abc_xyz(path: str | Path = ABC_XYZ_FILE, data_dir: Path = DATA_DIR, refresh_db: bool = True) -> dict[str, Any]:
+    """Write fact_abc_xyz_file from «ABC XYZ.xlsx»: the branch ABC / XYZ class
+    that fills the ROP workbook's missing classes in the dashboard.
 
+    Returns the stats; also stored under "abc_xyz_file" in metadata.json."""
+    frames = load_project_data(data_dir)
+    table, stats = load_abc_xyz_file(path, frames["dim_sku"], frames["dim_branch"], frames.get("alias_mapping"))
+    write_tables({"fact_abc_xyz_file": table}, data_dir=data_dir, refresh_db=refresh_db)
+    metadata_path = data_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+    metadata["abc_xyz_file"] = stats
+    save_json(metadata_path, metadata)
+    return stats
+
+
+def load_rop(rop: str | Path = ROP_FILE, powerbi: bool = False) -> dict[str, Any]:
+    """Load the final branch ROP workbook into the warehouse.
+
+    Returns the summary that the CLI prints; also the payload the Dagster
+    ``branch_rop`` asset turns into run metadata."""
+    rop = Path(rop)
     frames = load_project_data(DATA_DIR)
     dim_sku = frames["dim_sku"].copy()
     dim_branch = frames["dim_branch"].copy()
@@ -26,7 +51,7 @@ def main() -> None:
     metadata = json.loads((DATA_DIR / "metadata.json").read_text(encoding="utf-8"))
 
     # 1. Read the final ROP detail (one row per SKU x branch).
-    detail = pd.read_excel(args.rop, sheet_name="Нэгтгэл", engine="pyxlsb")
+    detail = pd.read_excel(rop, sheet_name="Нэгтгэл", engine="pyxlsb")
     detail["SKU_ID"] = pd.to_numeric(detail["SKU ID"], errors="coerce").astype("Int64")
     detail = detail[detail["SKU_ID"].notna()].copy()
     detail["SKU_ID"] = detail["SKU_ID"].astype(int)
@@ -67,6 +92,9 @@ def main() -> None:
     fact = fact[fact["Branch_ID"].notna()].reset_index(drop=True)
     fact["HasROP"] = fact["ROP"] > 0
     fact_branch_rop = to_fact_branch_rop(fact)  # also drops duplicate SKU x branch rows
+    # SKUs listed in the VED file keep that VED; the workbook's stays in VED_ROP.
+    fact_branch_rop = apply_sku_ved(fact_branch_rop, dim_sku)
+    ved_overridden = int((fact_branch_rop["VED"] != fact_branch_rop["VED_ROP"]).sum())
 
     # 4. Update the network-level ROP in dim_sku (sum of branch ROP per SKU).
     network_rop = fact_branch_rop.groupby("SKU_ID")["ROP"].sum()
@@ -94,11 +122,11 @@ def main() -> None:
         "dim_sku": dim_sku,
         "fact_branch_rop": fact_branch_rop,
         "fact_inventory_snapshot": fact_inventory,
-    }, powerbi=args.powerbi)
+    }, powerbi=powerbi)
 
     # 8. Update metadata.
     metadata.update({
-        "source_files": {**metadata.get("source_files", {}), "rop": Path(args.rop).name},
+        "source_files": {**metadata.get("source_files", {}), "rop": rop.name},
         "sku_count": int(len(dim_sku)),
         "branch_count": int((~tables["dim_branch"]["IsNetwork"]).sum()),
         "branch_rop_rows": int(len(fact_branch_rop)),
@@ -113,15 +141,31 @@ def main() -> None:
         "low_confidence_rop_sku": int((dim_sku["ROP_Confidence"] == "Бага").sum()),
     })
     save_json(DATA_DIR / "metadata.json", metadata)
+    abc_xyz = load_abc_xyz() if ABC_XYZ_FILE.exists() else None
 
-    print(json.dumps({
+    return {
+        "source_file": rop.name,
         "sku_count": int(len(dim_sku)),
+        "branch_count": int((~tables["dim_branch"]["IsNetwork"]).sum()),
         "branch_rop_rows": int(len(fact_branch_rop)),
         "network_rop_total": float(dim_sku["ROP_Used"].sum()),
         "corrected_branch_rop_total": float(fact_branch_rop["ROP"].sum()),
         "rop_gap_total": float(status["ROPGap"].sum(skipna=True)),
         "critical_ve_sku": int(status["IsCritical"].sum()),
-    }, ensure_ascii=False, indent=2))
+        "missing_rop_sku": int((~dim_sku["HasROP"]).sum()),
+        "ved_from_file_rows": ved_overridden,
+        "abc_xyz_file_rows": abc_xyz["rows"] if abc_xyz else 0,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Load the final branch ROP workbook into the warehouse.")
+    parser.add_argument("--rop", type=Path, default=ROP_FILE)
+    parser.add_argument("--powerbi", action="store_true", help="Also export readable CSVs to powerbi_data/")
+    parser.add_argument("--abc-xyz-only", action="store_true", help="Only reload «ABC XYZ.xlsx» (fact_abc_xyz_file)")
+    args = parser.parse_args()
+    result = load_abc_xyz() if args.abc_xyz_only else load_rop(args.rop, args.powerbi)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

@@ -17,8 +17,18 @@ snapshots/
 # Local safety copies
 _backup_before_rop_update/
 _backup_before_star_schema/
+_backup_before_ved_update/
+_backup_before_rop_a90/
 
 # Stale generated output
 dashboard_preview.html
 dashboard_preview.png
 QA_REPORT.txt
+
+# Inventory watcher: drop folder and logs (contain company data)
+inbox/
+logs/
+
+# Dagster instance: run history, event logs, compute logs, pickled asset outputs
+dagster_home/
+.dagster_home/
