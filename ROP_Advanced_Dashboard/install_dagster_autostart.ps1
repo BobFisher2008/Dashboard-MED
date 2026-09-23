@@ -50,6 +50,9 @@ if ($LASTEXITCODE -ne 0) {
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -WorkingDirectory $Project `
     -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Supervisor`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# Re-launch every 5 minutes: brings the supervisor back if it is ever ended;
+# while it runs, MultipleInstances IgnoreNew makes this a no-op.
+$trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `

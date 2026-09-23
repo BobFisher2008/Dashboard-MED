@@ -37,8 +37,12 @@ while ($true) {
         if (Test-Path $f) { Move-Item -Force $f "$f.1" }
     }
     Write-Note "starting Dagster"
-    $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "`"$Launcher`"" -WorkingDirectory $Project `
-        -WindowStyle Hidden -RedirectStandardOutput $Log -RedirectStandardError $ErrLog -PassThru
+    # Dagster gets its own hidden console: redirecting through Start-Process would
+    # share this one, and the Ctrl+C that Dagster's processes get when it stops
+    # would then end the supervisor as well (task result 0xC000013A).
+    $command = "`"`"$Launcher`" > `"$Log`" 2> `"$ErrLog`"`""
+    $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $command -WorkingDirectory $Project `
+        -WindowStyle Hidden -PassThru
     $process.WaitForExit()
     Write-Note "Dagster exited with code $($process.ExitCode); restarting in $RetrySeconds s"
     Start-Sleep -Seconds $RetrySeconds
