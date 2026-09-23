@@ -658,6 +658,57 @@ def _match_source_names(
     return src
 
 
+ROP_NAME_COLUMN = "Нэр төрөл"
+MATCH_RANK = {"Exact name": 0, "Master key": 1, "Alias": 2, "Unmatched": 3}
+
+
+def match_rop_skus(
+    detail: pd.DataFrame,
+    dim_sku: pd.DataFrame,
+    alias_mapping: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Set SKU_ID on the ROP workbook rows from their product name.
+
+    The workbook numbers products its own way: its «SKU ID» points at a
+    different product in dim_sku for about two thirds of the SKUs, and a few
+    IDs are shared by two products. The name is what both sides agree on, so
+    each row is matched like the category and VED files (exact name, then
+    master key, then alias) and goes to exactly one SKU: its own name first,
+    then the lowest SKU_ID. Rows whose name matches nothing are dropped.
+
+    Returns the matched rows (``SKU_ID`` set, the workbook's own ID kept in
+    ``WorkbookSKU_ID``) and the match stats."""
+    detail = detail.copy()
+    detail["WorkbookSKU_ID"] = pd.to_numeric(detail.get("SKU ID"), errors="coerce").astype("Int64")
+    detail["SourceName"] = detail[ROP_NAME_COLUMN].astype(str).str.strip()
+    names = pd.DataFrame({"SourceName": detail["SourceName"].unique()})
+    matched = _match_source_names(names, dim_sku, alias_mapping)
+    matched = (
+        matched.assign(_rank=matched["MatchType"].map(MATCH_RANK))
+        .sort_values(["_rank", "SKU_ID"])
+        .drop_duplicates("SourceName")
+        .set_index("SourceName")
+    )
+    detail["SKU_ID"] = detail["SourceName"].map(matched["SKU_ID"]).astype("Int64")
+    match_type = detail["SourceName"].map(matched["MatchType"])
+
+    found = detail["SKU_ID"].notna()
+    moved = found & detail["SKU_ID"].ne(detail["WorkbookSKU_ID"]).fillna(True)
+    unmatched_names = sorted(detail.loc[~found, "SourceName"].unique())
+    stats = {
+        "rows": int(len(detail)),
+        "matched_rows": int(found.sum()),
+        "unmatched_rows": int((~found).sum()),
+        "match_type_rows": {str(k): int(v) for k, v in match_type[found].value_counts().items()},
+        "rows_with_other_workbook_id": int(moved.sum()),
+        "sku_with_other_workbook_id": int(detail.loc[moved, "SKU_ID"].nunique()),
+        "unmatched_names": unmatched_names[:50],
+    }
+    out = detail.loc[found].drop(columns="SourceName")
+    out["SKU_ID"] = out["SKU_ID"].astype(int)
+    return out, stats
+
+
 def load_category_map(
     path: str | Path,
     dim_sku: pd.DataFrame,

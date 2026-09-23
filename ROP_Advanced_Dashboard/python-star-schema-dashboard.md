@@ -617,6 +617,18 @@ optional hook: --on-success / --on-failure "<command>"  (env: INVENTORY_FILE, SN
 - A fresh clone needs the source files plus `python warehouse.py build` before the app can run.
 
 ## Change log
+### 2026-09-23 — ROP workbook rows joined to SKUs by name; supervisor fix
+- **Fixed: ROP values sat on the wrong product.** `update_rop.py` joined «ROP final.xlsb» rows to `dim_sku` by the workbook's «SKU ID», but the workbook numbers products its own way (they diverge from ID 2274 on, and 4 IDs are shared by two products). 66,387 of 199,749 rows (4,416 SKUs) landed on another product.
+  - New `common.match_rop_skus`: rows are matched by «Нэр төрөл» like the category and VED files (exact name → master key → alias); each row goes to exactly one SKU, its own name first. The workbook ID is kept as `WorkbookSKU_ID`; rows with no match are dropped and counted.
+  - Today's workbook: all 199,749 rows match by exact name; the name → SKU mapping is one-to-one. Stats are in `metadata.json` → `rop_sku_match`.
+  - Verified: every non-excluded workbook row is in `fact_branch_rop` with its own product's ROP (21 duplicate SKU × branch rows resolve by the usual rule).
+  - SKUs that an earlier load gave a detail ROP but the workbook no longer lists fall back to `ROP_Current` («Нэгтгэл дэх fallback ROP», confidence Бага) instead of keeping a stale value: 89 not in the workbook, 87 listed only at excluded branches. The 93 former fallback SKUs now have their detail ROP.
+- **Effect on 2026-09-22** (before → after): ROP gap 36,917 → 24,288; «ROP байхгүй» 83,550 → 63,842; «Өгөгдөл алга» 120,471 → 100,763; «Илүүдэл» 41,522 → 58,525; «Хэвийн» 12,287 → 15,429; «ROP-оос доош» 7,940 → 7,499; «Тасарсан» 4 → 8; critical V/E 5,421 → 5,877; network ROP 440,583 → 337,728. Branch ROP total is unchanged (337,637): the same rows, on the right products.
+- **Trend history has a break at 2026-09-22.** Snapshots up to 2026-09-21 were computed with the ID join and are not recomputed; the jump between 09-21 and 09-22 is the fix, not a change in stock.
+- **A ROP reload now rewrites the current date's `snapshots/status_*.csv.gz`** (`warehouse.save_status_snapshot`). Before, the next history rebuild brought back that date's status under the previous ROP (this also affected the 2026-09-22 A × 90% reload).
+- **Supervisor fix.** `dagster_supervisor.ps1` started Dagster in its own console, so the Ctrl+C that Dagster's processes get on shutdown also ended the supervisor (task result `0xC000013A`); after that nothing restarted Dagster. Dagster now gets a separate hidden console, and the «ROP Dagster» task re-launches the supervisor every 5 minutes if it is not running. Verified: killing Dagster left the supervisor running and it restarted Dagster after 60 s.
+- Backup of `data/` from before the reload: `_backup_before_sku_name_match/` (with `before_metrics.json`).
+
 ### 2026-09-22 — Automatic refresh end to end
 - **Dashboard live refresh** (`app.py`): every open page checks every 60 s whether `data/*.parquet`, `metadata.json` or «Салбарын жагсаалт.txt» changed, waits until the newest file is 20 s old (an ETL run writes several files), then reloads every table and redraws every tab. Filters stay; the header shows «● Шинэчлэгдлээ HH:MM». A page with an uploaded file is not overwritten; it shows «Шинэ өгөгдөл ирсэн» instead.
 - **`source_files_sensor`** (Dagster, on by default): watches «ROP final.xlsb» and «ABC XYZ.xlsx» → `rop_reload_job`, and «SKU category.csv» / «VED ангилал.csv» → new `classification_reload_job` (`warehouse_db` only). A file counts once its size and mtime held for a whole 60 s tick, so a workbook Excel is still saving is never read. The first tick only records the files: starting Dagster does not reload.
@@ -812,7 +824,7 @@ optional hook: --on-success / --on-failure "<command>"  (env: INVENTORY_FILE, SN
 - Both `warehouse.connect()` (Parquet, used by the dashboard) and `data/warehouse.duckdb` (used by external tools) exist. The DuckDB file is only as fresh as the last `warehouse_db` materialisation or `warehouse.py build`.
 - Run-status sensors for success / failure notification are not written yet; the watcher's `--on-success` / `--on-failure` hooks have no Dagster equivalent in place.
 - **The sensor and the schedule ship stopped and must be enabled once** (UI → Automation, or `dagster sensor start -m dagster_rop.definitions inbox_sensor`). Until then a file dropped in `inbox/` just sits there — there is no error, because nothing is watching.
-- **Autostart since 2026-09-22** (reverses the 2026-09-21 decision). The «ROP Dagster» logon task (`install_dagster_autostart.ps1`) runs `dagster_supervisor.ps1`, which keeps Dagster running hidden and restarts it within a minute if it stops; it waits while a Dagster started by hand holds port 3000. `install_dagster_autostart.ps1 -Status` shows the state; logs in `logs/dagster*.log`.
+- **Autostart since 2026-09-22** (reverses the 2026-09-21 decision). The «ROP Dagster» logon task (`install_dagster_autostart.ps1`) runs `dagster_supervisor.ps1`, which keeps Dagster running hidden and restarts it within a minute if it stops; it waits while a Dagster started by hand holds port 3000. The task also re-launches the supervisor every 5 minutes if it has ended (2026-09-23). `install_dagster_autostart.ps1 -Status` shows the state; logs in `logs/dagster*.log`.
 - The sensor needs ~30-60 s to pick a file up, against the watcher's ~5 s. One tick of unchanged size and mtime is how it knows the copy finished.
 - `inbox/.watcher_state.json` is a leftover from the watcher. It is harmless, but it is a reminder not to run `watch_inventory.py` and `inbox_sensor` together.
 - **ROP was calculated with the workbook's VED, not the VED file's** (2026-09-21).
@@ -823,8 +835,5 @@ optional hook: --on-success / --on-failure "<command>"  (env: INVENTORY_FILE, SN
 - 953 SKUs are not in `VED ангилал.csv` and keep their earlier VED (`VED_Source` = "ROP мастер").
 - SKU 3445: the alias table maps «Cumlaude lab үтрээний гүн чийгшүүлэх лаа» (a suppository, VED E) to this SKU, which is the gel «Cumlaude lab MD Үтрээ чийгшүүлэх гель…» (VED D). The SKU's own name wins (D); the alias looks wrong.
 - The ROP confidence *filter* is gone, but ROP confidence still appears in the SKU table's «Confidence» column, the SKU detail line, the «Low-confidence ROP» bar on the data-quality tab and the methodology text.
-- Reloading `ROP final.xlsb` now would change `dim_sku.ROP_Used` for some SKUs compared with the current warehouse. This existed before and is unrelated to VED; `fact_sku_status` is unaffected.
-  - Network ROP total 454,599 → 453,054.
-  - «Missing ROP SKU» 36 → 38.
 - `Үлд 0921.csv` (2026-09-21) failed twice in the Dagster inbox run (11:44, 12:36; now in `inbox/failed/`). Its quantity column is headed `2026-09-21` — the known date-header limitation above. The dashboard still shows the 2026-09-18 snapshot.
 - After this change the running `bokeh serve` and `dagster dev` hold the old code; restart both.

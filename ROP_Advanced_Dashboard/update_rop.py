@@ -7,12 +7,13 @@ from typing import Any
 
 import pandas as pd
 
-from common import build_status_snapshot, excluded_mask, load_abc_xyz_file, load_project_data, save_json
+from common import build_status_snapshot, excluded_mask, load_abc_xyz_file, load_project_data, match_rop_skus, save_json
 from warehouse import (
     DATA_DIR,
     apply_sku_ved,
     branch_rop_wide,
     ensure_branches,
+    save_status_snapshot,
     status_tables,
     to_fact_branch_rop,
     write_tables,
@@ -21,6 +22,8 @@ from warehouse import (
 BASE = Path(__file__).resolve().parent
 ROP_FILE = BASE / "ROP final.xlsb"
 ABC_XYZ_FILE = BASE / "ABC XYZ.xlsx"
+DETAIL_ROP_SOURCE = "Зассан дэлгэрэнгүй томьёо"
+FALLBACK_ROP_SOURCE = "Нэгтгэл дэх fallback ROP"
 
 
 def load_abc_xyz(path: str | Path = ABC_XYZ_FILE, data_dir: Path = DATA_DIR, refresh_db: bool = True) -> dict[str, Any]:
@@ -50,11 +53,11 @@ def load_rop(rop: str | Path = ROP_FILE, powerbi: bool = False) -> dict[str, Any
     fact_inventory = frames["fact_inventory_snapshot"].copy()
     metadata = json.loads((DATA_DIR / "metadata.json").read_text(encoding="utf-8"))
 
-    # 1. Read the final ROP detail (one row per SKU x branch).
+    # 1. Read the final ROP detail (one row per SKU x branch). Rows are joined
+    #    to dim_sku by product name: the workbook's own «SKU ID» numbering
+    #    differs from the SKU master's.
     detail = pd.read_excel(rop, sheet_name="Нэгтгэл", engine="pyxlsb")
-    detail["SKU_ID"] = pd.to_numeric(detail["SKU ID"], errors="coerce").astype("Int64")
-    detail = detail[detail["SKU_ID"].notna()].copy()
-    detail["SKU_ID"] = detail["SKU_ID"].astype(int)
+    detail, sku_match = match_rop_skus(detail, dim_sku, frames.get("alias_mapping"))
     detail = detail.loc[~excluded_mask(detail["Салбар"])].copy()
 
     # 2. Keep every existing Branch_ID (history refers to them) and add new ones.
@@ -101,10 +104,16 @@ def load_rop(rop: str | Path = ROP_FILE, powerbi: bool = False) -> dict[str, Any
     dim_sku["ROP_Corrected"] = dim_sku["SKU_ID"].map(network_rop).fillna(0)
     in_new = dim_sku["SKU_ID"].isin(network_rop.index)
     dim_sku.loc[in_new, "ROP_Used"] = dim_sku.loc[in_new, "ROP_Corrected"]
-    dim_sku.loc[in_new, "ROP_Source"] = "Зассан дэлгэрэнгүй томьёо"
+    dim_sku.loc[in_new, "ROP_Source"] = DETAIL_ROP_SOURCE
     dim_sku.loc[in_new, "ROP_Confidence"] = "Өндөр"
+    # A SKU that an earlier load gave a detail ROP but this workbook no longer
+    # lists goes back to the master's own ROP instead of keeping a stale one.
+    stale = ~in_new & dim_sku["ROP_Source"].eq(DETAIL_ROP_SOURCE)
+    dim_sku.loc[stale, "ROP_Used"] = pd.to_numeric(dim_sku.loc[stale, "ROP_Current"], errors="coerce").fillna(0)
+    dim_sku.loc[stale, "ROP_Source"] = FALLBACK_ROP_SOURCE
+    dim_sku.loc[stale, "ROP_Confidence"] = "Бага"
     dim_sku["HasROP"] = dim_sku["ROP_Used"] > 0
-    dim_sku["HasDetailROP"] = dim_sku["ROP_Source"].eq("Зассан дэлгэрэнгүй томьёо")
+    dim_sku["HasDetailROP"] = dim_sku["ROP_Source"].eq(DETAIL_ROP_SOURCE)
 
     # 5. Remap inventory Branch_ID to the branch dimension (no-op for existing branches).
     fact_inventory["Branch_ID"] = fact_inventory["BranchName"].astype(str).map(existing_branch_id).fillna(fact_inventory["Branch_ID"])
@@ -123,10 +132,14 @@ def load_rop(rop: str | Path = ROP_FILE, powerbi: bool = False) -> dict[str, Any
         "fact_branch_rop": fact_branch_rop,
         "fact_inventory_snapshot": fact_inventory,
     }, powerbi=powerbi)
+    # History is rebuilt from the snapshot files: without this, the next
+    # inventory refresh would bring back this date's status under the old ROP.
+    save_status_snapshot(status, snapshot_date)
 
     # 8. Update metadata.
     metadata.update({
         "source_files": {**metadata.get("source_files", {}), "rop": rop.name},
+        "rop_sku_match": sku_match,
         "sku_count": int(len(dim_sku)),
         "branch_count": int((~tables["dim_branch"]["IsNetwork"]).sum()),
         "branch_rop_rows": int(len(fact_branch_rop)),
@@ -154,6 +167,9 @@ def load_rop(rop: str | Path = ROP_FILE, powerbi: bool = False) -> dict[str, Any
         "critical_ve_sku": int(status["IsCritical"].sum()),
         "missing_rop_sku": int((~dim_sku["HasROP"]).sum()),
         "ved_from_file_rows": ved_overridden,
+        "rop_rows_matched_by_name": sku_match["matched_rows"],
+        "rop_rows_unmatched": sku_match["unmatched_rows"],
+        "rop_rows_with_other_workbook_id": sku_match["rows_with_other_workbook_id"],
         "abc_xyz_file_rows": abc_xyz["rows"] if abc_xyz else 0,
     }
 

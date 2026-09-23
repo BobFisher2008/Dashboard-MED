@@ -2,7 +2,15 @@
 import pandas as pd
 import pytest
 
-from common import VED_FILE_SOURCE, VED_MASTER_SOURCE, apply_ved_map, build_status_snapshot, clean_ved, load_ved_map
+from common import (
+    VED_FILE_SOURCE,
+    VED_MASTER_SOURCE,
+    apply_ved_map,
+    build_status_snapshot,
+    clean_ved,
+    load_ved_map,
+    match_rop_skus,
+)
 from metrics import MetricsCalculator
 from queries import CLASS_ORDER, TOTAL, UNKNOWN_CLASS, Filters
 from warehouse import (
@@ -100,6 +108,42 @@ def test_apply_ved_map_marks_the_listed_skus(dim_sku):
     again = apply_ved_map(out, pd.Series({3: "E"}))
     assert again["VED"].tolist() == ["V", "V", "E"]
     assert again["VED_Source"].tolist() == [VED_MASTER_SOURCE, VED_FILE_SOURCE, VED_FILE_SOURCE]
+
+
+# --------------------------------------------------------------------------
+# Matching ROP workbook rows to SKUs
+# --------------------------------------------------------------------------
+def test_match_rop_skus_goes_by_name_not_workbook_id(dim_sku):
+    """The workbook's «SKU ID» is its own numbering; the product name decides
+    the SKU. Twins that share a key each keep their own name's rows."""
+    master = pd.concat([dim_sku, pd.DataFrame({
+        "SKU_ID": [10, 11], "SKU_Name": ["Бумба N6", "Бумба №6"], "MasterKey": ["БУМБАN6", "БУМБАN6"],
+    })], ignore_index=True)
+    alias = pd.DataFrame({"NormalizedKey": ["PARACETAMOL"], "SKU_ID": [2]})
+    detail = pd.DataFrame({
+        "SKU ID": [2, 2, 5, 9, 12, 7, 8],
+        "Нэр төрөл": [
+            "Тобрекс дусал",        # workbook ID 2 is another product: goes to SKU 1
+            "Парацетамол 500мг",    # same ID on both sides
+            "Витамин-C",            # master key only
+            "Бумба №6 ",            # twin: its own name wins over the shared key; trailing space
+            "Бумба N6",
+            "Paracetamol",          # alias
+            "Үл мэдэгдэх бараа",    # unmatched: dropped
+        ],
+        "Салбар": ["АФ Төв э/сан"] * 7,
+    })
+    out, stats = match_rop_skus(detail, master, alias)
+
+    assert out["SKU_ID"].tolist() == [1, 2, 3, 11, 10, 2]
+    assert out["WorkbookSKU_ID"].tolist() == [2, 2, 5, 9, 12, 7]
+    assert "SourceName" not in out
+    assert stats == {
+        "rows": 7, "matched_rows": 6, "unmatched_rows": 1,
+        "match_type_rows": {"Exact name": 4, "Master key": 1, "Alias": 1},
+        "rows_with_other_workbook_id": 5, "sku_with_other_workbook_id": 5,
+        "unmatched_names": ["Үл мэдэгдэх бараа"],
+    }
 
 
 # --------------------------------------------------------------------------

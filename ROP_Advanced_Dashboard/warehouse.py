@@ -428,13 +428,24 @@ def status_tables(status_wide: pd.DataFrame, dim_branch: pd.DataFrame, *branch_s
     }
 
 
+FAST_GZIP = {"method": "gzip", "compresslevel": 1}
+
+
+def save_status_snapshot(status_wide: pd.DataFrame, snapshot_date: Any, snapshot_dir: Path = SNAPSHOT_DIR) -> Path:
+    """Write the status file that history is rebuilt from. A ROP reload calls
+    this for the current date as well, so the next rebuild keeps its ROP."""
+    snapshot_dir.mkdir(exist_ok=True)
+    path = snapshot_dir / f"status_{pd.Timestamp(snapshot_date).strftime('%Y%m%d')}.csv.gz"
+    status_wide.to_csv(path, index=False, encoding="utf-8-sig", compression=FAST_GZIP)
+    return path
+
+
 def save_snapshot_files(inventory: pd.DataFrame, status_wide: pd.DataFrame, review: pd.DataFrame, snapshot_date: Any,
                         snapshot_dir: Path = SNAPSHOT_DIR) -> None:
     snapshot_dir.mkdir(exist_ok=True)
     stamp = pd.Timestamp(snapshot_date).strftime("%Y%m%d")
-    fast_gzip = {"method": "gzip", "compresslevel": 1}
-    inventory.to_csv(snapshot_dir / f"inventory_{stamp}.csv.gz", index=False, encoding="utf-8-sig", compression=fast_gzip)
-    status_wide.to_csv(snapshot_dir / f"status_{stamp}.csv.gz", index=False, encoding="utf-8-sig", compression=fast_gzip)
+    inventory.to_csv(snapshot_dir / f"inventory_{stamp}.csv.gz", index=False, encoding="utf-8-sig", compression=FAST_GZIP)
+    save_status_snapshot(status_wide, snapshot_date, snapshot_dir)
     review.to_csv(snapshot_dir / f"mapping_review_{stamp}.csv", index=False, encoding="utf-8-sig")
 
 

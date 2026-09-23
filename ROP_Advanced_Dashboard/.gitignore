@@ -19,6 +19,7 @@ _backup_before_rop_update/
 _backup_before_star_schema/
 _backup_before_ved_update/
 _backup_before_rop_a90/
+_backup_before_sku_name_match/
 
 # Stale generated output
 dashboard_preview.html

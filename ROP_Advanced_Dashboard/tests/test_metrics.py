@@ -12,7 +12,7 @@ from common import (
 )
 from metrics import MetricsCalculator
 from queries import TOTAL, Filters
-from warehouse import to_fact_status
+from warehouse import read_snapshot_history, save_status_snapshot, to_fact_status
 
 
 @pytest.mark.parametrize("on_hand, rop, has_data, expected", [
@@ -65,6 +65,19 @@ def test_status_snapshot_to_fact_round_trip(status_wide):
     assert row["Supplier"] == "Нийлүүлэгч А; Нийлүүлэгч Б"
     # the duplicate ROP row (ROP 0) lost against the real one
     assert fact.set_index(["SKU_ID", "Branch_ID"]).loc[(2, "B002"), "ROP"] == 5
+
+
+def test_rewritten_status_snapshot_replaces_the_date_in_history(tmp_path, status_wide):
+    """A ROP reload rewrites the current date's status file; history rebuilt
+    from the files then carries the new ROP, not the one from the refresh."""
+    save_status_snapshot(status_wide, "2026-09-16", tmp_path)
+    reloaded = status_wide.assign(ROP=status_wide["ROP"] * 2)
+    path = save_status_snapshot(reloaded, "2026-09-16", tmp_path)
+
+    assert path.name == "status_20260916.csv.gz"
+    history, _ = read_snapshot_history(tmp_path)
+    expected = to_fact_status(reloaded).set_index(["SKU_ID", "Branch_ID"])["ROP"]
+    assert history.set_index(["SKU_ID", "Branch_ID"])["ROP"].to_dict() == expected.to_dict()
 
 
 def test_to_fact_status_is_idempotent(status_wide):
